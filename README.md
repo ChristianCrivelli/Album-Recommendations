@@ -1,6 +1,4 @@
 # Album Recommendations
-[![Ask DeepWiki](https://devin.ai/assets/askdeepwiki.png)](https://deepwiki.com/ChristianCrivelli/Album-Recommendations)
-
 This repository contains a Streamlit web application that serves album recommendations from a personal music collection managed in a Notion database. It allows users to explore, filter, and discover music based on manually entered ratings.
 
 ## How It Works
