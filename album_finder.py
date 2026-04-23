@@ -90,3 +90,20 @@ def get_metadata(album_name, artist_name):
         print(f"MusicBrainz Error for {album_name}: {exc}")
         return None
     
+def get_producers(release_id):
+    result = musicbrainzngs.get_release_by_id(release_id, includes=["artist-rels"])
+    
+    producers = []
+    
+    # Look through the relationships for this release
+    if 'artist-relation-list' in result['release']:
+        for rel in result['release']['artist-relation-list']:
+            # We specifically look for the 'producer' type
+            if rel['type'] == 'producer':
+                artist_info = rel['artist']
+                producers.append({
+                    'name': artist_info['name'],
+                    'mbid': artist_info['id']
+                })
+                
+    return producers

@@ -1,4 +1,2 @@
 1. Fix the files name (adopt some sort of convention for calrity)
-2. Add logic to "clean" albums that are rated at less than a 5.
-3. Split "artists" in the original df otherwise it may cause damange in the call inside album_finder
 4. Avg Track vs Total Album Length
