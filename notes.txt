@@ -1,2 +1,0 @@
-1. Fix the files name (adopt some sort of convention for calrity)
-4. Avg Track vs Total Album Length

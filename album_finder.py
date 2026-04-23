@@ -75,6 +75,15 @@ def get_metadata(album_name, artist_name):
         # 3. Return the compiled feature vector
         print(f"Found data for {album_name} by {artist_name}")
 
+        artist_dicts = []
+        if 'artist-credit' in release_data:
+            for c in release_data['artist-credit']:
+                if isinstance(c, dict) and 'artist' in c:
+                    artist_dicts.append({
+                        'name': c['artist']['name'],
+                        'mbid': c['artist']['id']
+                    })
+
         return {
             "Album": album_name,
             "Primary Type": primary_type,
@@ -83,7 +92,9 @@ def get_metadata(album_name, artist_name):
             "Top Tags": top_tags,
             "Avg Track Length (Mins)": avg_track_length,
             "Labels": labels,
-            "Artist MBIDs": artist_mbids
+            "Artist MBIDs": artist_mbids,
+            "Release ID": release_id,
+            "Artists": artist_dicts  
         }
         
     except musicbrainzngs.WebServiceError as exc:

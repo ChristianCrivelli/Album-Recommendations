@@ -9,8 +9,8 @@ from supabase import create_client, Client
 
 load_dotenv()
 
-url = os.environ.get("SUPABASE_URL")
-key = os.environ.get("SUPABASE_SERVICE_KEY")
+url = os.environ.get("supabase_url")
+key = os.environ.get("supabase_key")
 
 supabase: Client = create_client(url, key)
 
@@ -33,25 +33,24 @@ for row in df.itertuples():
     meta = get_metadata(row.Title, search_artist)
 
     # 2. Insert/Get Artist ID
-    if meta and meta.get('release_id'):
-        release_id = meta['release_id']
+    if meta and meta.get('Release ID'): 
+        release_id = meta['Release ID']
 
         # Entity A (Album)
         album_data = {
             "title": row.Title,
             "mbid": release_id,
             "rating": row.Rating,
-            "primary_type": meta.get('primary_type'),
-            "release_year": meta.get('release_year'),
-            "top_tags": meta.get('top_tags'), 
-            "avg_length": meta.get('avg_length'),
+            "primary_type": meta.get('Primary Type'),
+            "release_year": meta.get('Release Year'),
+            "avg_length": meta.get('Avg Track Length (Mins)'),
         }
 
         # Entities B & C (Contributors)
         producers = get_producers(release_id)
         contributors = []
         
-        for artist in meta.get('artists', []):
+        for artist in meta.get('Artists', []):
             contributors.append({
                 'name': artist['name'],
                 'mbid': artist['mbid'],
@@ -66,8 +65,9 @@ for row in df.itertuples():
             })
         
         # Push into Supabase
+        # Push into Supabase
         try:
-            # Step 1: Upsert Album
+            # Upsert Album
             album_resp = supabase.table("albums").upsert(
                 album_data, 
                 on_conflict="mbid"
@@ -80,7 +80,7 @@ for row in df.itertuples():
                 
             album_db_id = album_resp.data[0]['id']
             
-            # Step 2: Loop through all contributors
+            # Loop through all contributors
             for person in contributors:
                 if person.get('mbid'):
                     person_resp = supabase.table("artists").upsert(
@@ -103,13 +103,37 @@ for row in df.itertuples():
                             on_conflict="album_id,person_id,role"
                         ).execute()
             
-            print(f"Success! Added {len(contributors)} contributors.")
+            # Loop through all tags
+            top_tags = meta.get('Top Tags', [])
+
+            for tag_name in top_tags:
+                # Upsert the tag into a 'tags' table
+                tag_resp = supabase.table("tags").upsert(
+                    {"name": tag_name}, 
+                    on_conflict="name" # Assumes 'name' is unique in your tags table
+                ).execute()
+                
+                if tag_resp.data:
+                    tag_db_id = tag_resp.data[0]['id']
+                    
+                    # Create the link in the Tag Junction Table
+                    tag_link_data = {
+                        "album_id": album_db_id,
+                        "tag_id": tag_db_id
+                    }
+                    
+                    supabase.table("album_tags").upsert(
+                        tag_link_data, 
+                        on_conflict="album_id,tag_id"
+                    ).execute()
+
+            print(f"Success! Added {len(contributors)} contributors and {len(top_tags)} tags.")
             
         except Exception as e:
             print(f"Database error for {row.Title}: {e}")
 
     else:
-        print(f"Could not find MusicBrainz data for {row.Title}")
+        print(f"Could not find MusicBrainz data for {row.Title}") ## Should save these to a csv
 
     time.sleep(1.5) # Sleep to respect rate limits
 
