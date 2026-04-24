@@ -11,13 +11,34 @@ def fetch_notion_dataframe():
     notion = Client(auth=os.getenv("notion_key"))
     database_id = os.getenv("database_id")
 
-    # 1. Get the raw data
+    # 1. Get the data_source_id (The correct modern API method you originally had!)
     db_info = notion.databases.retrieve(database_id=database_id)
     data_source_id = db_info["data_sources"][0]["id"]
-    response = notion.data_sources.query(data_source_id=data_source_id)
-    results = response.get("results")
 
-    # 2. Parse the nested JSON into a simple list of dictionaries
+    # 2. Get the raw data with Pagination to bypass the 100 limit
+    results = []
+    has_more = True
+    next_cursor = None
+
+    while has_more:
+        # Prepare the query parameters using the data_source_id
+        query_params = {"data_source_id": data_source_id}
+        
+        # If we have a cursor from a previous loop, pass it to get the next page
+        if next_cursor:
+            query_params["start_cursor"] = next_cursor
+            
+        # Query the data_source, NOT databases!
+        response = notion.data_sources.query(**query_params)
+        
+        # Append this page's results to our master list
+        results.extend(response.get("results", []))
+        
+        # Update pagination variables for the next loop iteration
+        has_more = response.get("has_more", False)
+        next_cursor = response.get("next_cursor", None)
+
+    # 3. Parse the nested JSON into a simple list of dictionaries
     flattened_data = []
     
     for page in results:
@@ -46,7 +67,6 @@ def fetch_notion_dataframe():
             
         flattened_data.append(row)
 
-
-    # 3. Create the DataFrame
-    print("Notion Data Pulled Succesfully!") #sanity check
+    # 4. Create the DataFrame
+    print(f"Notion Data Pulled Successfully! Total rows: {len(flattened_data)}") # sanity check
     return pd.DataFrame(flattened_data)
