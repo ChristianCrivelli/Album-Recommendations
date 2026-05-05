@@ -1,9 +1,8 @@
 import os
-import time
 import pandas as pd
-from album_finder import get_metadata, get_producers
-from pull_albums import fetch_notion_dataframe
-from cleaning_methods import clean_artist_list
+from ingestion.album_finder import get_metadata, get_producers
+from ingestion.pull_albums import fetch_notion_dataframe
+from ingestion.cleaning_methods import clean_artist_list
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -24,9 +23,14 @@ df['Artists'] = df['Artists'].apply(clean_artist_list)
 
 print(f"Loaded {len(df)} albums from Notion.")
 
+# Tip 3: track failures so we can save them at the end
+failures = []
+
 # === Loop through the table from Notion to enrich it with Musicbrainz Data ===
+n = 1
 for row in df.itertuples():
-    print(f"--- Processing: {row.Title} ---")
+    print(f"--- Processing N.{n}: {row.Title} ---")
+    n += 1
 
     # 1. Get metadata
     search_artist = ", ".join(row.Artists)
@@ -65,7 +69,6 @@ for row in df.itertuples():
             })
         
         # Push into Supabase
-        # Push into Supabase
         try:
             # Upsert Album
             album_resp = supabase.table("albums").upsert(
@@ -76,6 +79,7 @@ for row in df.itertuples():
             # Ensure we got data back before extracting the UUID
             if not album_resp.data:
                 print(f"Warning: No data returned from Supabase for {row.Title}. Check RLS policies.")
+                failures.append({"title": row.Title, "artists": search_artist, "reason": "Supabase returned no data"})
                 continue
                 
             album_db_id = album_resp.data[0]['id']
@@ -131,10 +135,17 @@ for row in df.itertuples():
             
         except Exception as e:
             print(f"Database error for {row.Title}: {e}")
+            failures.append({"title": row.Title, "artists": search_artist, "reason": f"DB error: {e}"})
 
     else:
-        print(f"Could not find MusicBrainz data for {row.Title}") ## Should save these to a csv
+        print(f"Could not find MusicBrainz data for {row.Title}")
+        # Tip 3: record the failure with a reason so it's easy to investigate
+        failures.append({"title": row.Title, "artists": search_artist, "reason": "MusicBrainz lookup failed"})
 
-    time.sleep(1.5) # Sleep to respect rate limits
-
-print("Done!")
+# Tip 3: write all failures to a CSV after the run completes
+if failures:
+    failures_df = pd.DataFrame(failures)
+    failures_df.to_csv("failed_lookups.csv", index=False)
+    print(f"\nDone! {len(failures)} album(s) failed — saved to failed_lookups.csv")
+else:
+    print("\nDone! All albums processed successfully.")

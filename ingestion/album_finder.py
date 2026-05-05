@@ -1,21 +1,27 @@
 import os
+import time
 import musicbrainzngs
 from dotenv import load_dotenv
-
+ 
 load_dotenv()
-
+ 
 # User Agent
 musicbrainzngs.set_useragent(
     app = "SimilarityMatrixBuilder", 
     version = "1.0", 
     contact = os.getenv("email")
 )
-
+ 
+# MusicBrainz allows 1 request/sec. We make multiple calls per album,
+# so we sleep between each one to stay safe.
+MB_SLEEP = 1.1
+ 
 def get_metadata(album_name, artist_name):
     try:
         # 1. Search for the Release Group
         # Searching by Release Group is better for catching the "master" record
         search = musicbrainzngs.search_release_groups(artist=artist_name, releasegroup=album_name, limit=1)
+        time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
         
         if not search.get('release-group-list'):
             return None
@@ -25,6 +31,7 @@ def get_metadata(album_name, artist_name):
         # 2. Fetch Full Release Group Data
         # Includes tags (genres/vibes) and the list of specific releases (CDs, Vinyls, etc.)
         rg_data = musicbrainzngs.get_release_group_by_id(rg_id, includes=["tags", "releases"])['release-group']
+        time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
         
         # --- EXTRACT HIGHER-LEVEL TAXONOMY ---
         primary_type = rg_data.get('primary-type', 'Unknown')
@@ -43,13 +50,16 @@ def get_metadata(album_name, artist_name):
         avg_track_length = None
         labels = []
         artist_mbids = []
-        
+        artist_dicts = []  # Tip 2: initialise here so it always exists
+        release_id = None  # Tip 2: initialise here so it always exists
+ 
         # We need a specific release to get tracks and labels. We'll just grab the first one.
         if 'release-list' in rg_data and len(rg_data['release-list']) > 0:
             release_id = rg_data['release-list'][0]['id']
             
             # Fetch the specific release including tracks, labels, and artist credits
             release_data = musicbrainzngs.get_release_by_id(release_id, includes=["recordings", "labels", "artist-credits"])['release']
+            time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
             
             # Extract Labels
             if 'label-info-list' in release_data:
@@ -71,19 +81,19 @@ def get_metadata(album_name, artist_name):
             if track_count > 0:
                 avg_ms = total_ms / track_count
                 avg_track_length = round(avg_ms / 60000, 2) # Convert to minutes
+ 
+            # Tip 2: build artist_dicts inside the block where release_data is guaranteed to exist
+            if 'artist-credit' in release_data:
+                for c in release_data['artist-credit']:
+                    if isinstance(c, dict) and 'artist' in c:
+                        artist_dicts.append({
+                            'name': c['artist']['name'],
+                            'mbid': c['artist']['id']
+                        })
                 
         # 3. Return the compiled feature vector
         print(f"Found data for {album_name} by {artist_name}")
-
-        artist_dicts = []
-        if 'artist-credit' in release_data:
-            for c in release_data['artist-credit']:
-                if isinstance(c, dict) and 'artist' in c:
-                    artist_dicts.append({
-                        'name': c['artist']['name'],
-                        'mbid': c['artist']['id']
-                    })
-
+ 
         return {
             "Album": album_name,
             "Primary Type": primary_type,
@@ -103,6 +113,7 @@ def get_metadata(album_name, artist_name):
     
 def get_producers(release_id):
     result = musicbrainzngs.get_release_by_id(release_id, includes=["artist-rels"])
+    time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
     
     producers = []
     
@@ -118,3 +129,13 @@ def get_producers(release_id):
                 })
                 
     return producers
+ 
+
+
+
+
+
+
+
+
+
