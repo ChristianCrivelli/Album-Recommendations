@@ -1,10 +1,11 @@
 import os
 import pandas as pd
-from ingestion.album_finder import get_metadata, get_producers
-from ingestion.pull_albums import fetch_notion_dataframe
-from ingestion.cleaning_methods import clean_artist_list
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from ingestion.pull_albums import fetch_notion_dataframe
+from ingestion.album_finder import get_metadata, get_producers
+from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
+
 
 load_dotenv()
 
@@ -108,7 +109,9 @@ for row in df.itertuples():
                         ).execute()
             
             # Loop through all tags
-            top_tags = meta.get('Top Tags', [])
+            raw_tags = meta.get('Top Tags', [])
+
+            top_tags = clean_and_normalize_tags(raw_tags)
 
             for tag_name in top_tags:
                 # Upsert the tag into a 'tags' table
