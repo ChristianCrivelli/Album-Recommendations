@@ -32,12 +32,12 @@ jobs:
     # We pass the GitHub secrets into the runner's environment variables
     - name: Run Python script
       env:
-        notion_key: ${{ secrets.notion_key }}
-        database_id: ${{ secrets.database_id }}
-        spotify_key: ${{ secrets.spotify_key }}
-        spotify_id: ${{ secrets.spotify_id }}
-        email: ${{ secrets.email }}
-        supabase_url: ${{ secrets.supabase_url }}
-        supabase_key: ${{ secrets.supabase_key }}
+        notion_key: ${{ secrets.NOTION_KEY }}
+        database_id: ${{ secrets.DATABASE_ID }}
+        spotify_key: ${{ secrets.SPOTIFY_KEY }}
+        spotify_id: ${{ secrets.SPOTIFY_ID }}
+        email: ${{ secrets.EMAIL }}
+        supabase_url: ${{ secrets.SUPABASE_URL }}
+        supabase_key: ${{ secrets.SUPABASE_KEY }}
       run: |
         python -m ingestion.album_push_logic
