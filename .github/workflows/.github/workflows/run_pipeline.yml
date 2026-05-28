@@ -1,0 +1,43 @@
+name: Run Album Pipeline
+
+on:
+  schedule:
+    # Runs at 04:00 AM UTC every single day
+    - cron: '0 4 * * *'
+  workflow_dispatch: # Allows you to also trigger it manually from the GitHub website
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Check out your code from GitHub onto the cloud runner
+    - name: Check out repository code
+      uses: actions/checkout@v4
+
+    # 2. Set up Python on the cloud environment
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-with-version: '3.11' 
+        cache: 'pip' # Automatically caches your packages for faster subsequent runs
+
+    # 3. Install all dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas supabase musicbrainzngs python-dotenv notion-client scikit-learn numpy
+
+    # 4. Execute the pipeline
+    # We pass the GitHub secrets into the runner's environment variables
+    - name: Run Python script
+      env:
+        notion_key: ${{ secrets.notion_key }}
+        database_id: ${{ secrets.database_id }}
+        spotify_key: ${{ secrets.spotify_key }}
+        spotify_id: ${{ secrets.spotify_id }}
+        email: ${{ secrets.email }}
+        supabase_url: ${{ secrets.supabase_url }}
+        supabase_key: ${{ secrets.supabase_key }}
+      run: |
+        python -m ingestion.album_push_logic

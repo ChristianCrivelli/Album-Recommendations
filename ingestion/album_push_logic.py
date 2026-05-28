@@ -1,7 +1,10 @@
 import os
+import sys
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client, Client
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))npm run dev
 from ingestion.pull_albums import fetch_notion_dataframe
 from ingestion.album_finder import get_metadata, get_producers
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
