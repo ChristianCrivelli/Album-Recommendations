@@ -17,6 +17,16 @@ key = os.environ.get("supabase_key")
 
 supabase: Client = create_client(url, key)
 
+# FULL_SYNC=true forces a ground-up rebuild (used by the monthly deep sync).
+# Otherwise this is a delta pull: only new albums hit MusicBrainz/Spotify.
+FULL_SYNC = os.getenv("FULL_SYNC", "false").strip().lower() == "true"
+
+
+def get_existing_titles() -> set:
+    resp = supabase.table("albums").select("title").execute()
+    return {row["title"].strip().lower() for row in resp.data if row.get("title")}
+
+
 # === Get the Data From Notion ===
 df = fetch_notion_dataframe()
 df = df[['Title', 'Artist(s)', 'Rating/10']]
@@ -26,6 +36,22 @@ df = df.rename(columns={'Artist(s)': 'Artists', 'Rating/10': 'Rating'})
 df['Artists'] = df['Artists'].apply(clean_artist_list)
 
 print(f"Loaded {len(df)} albums from Notion.")
+
+# === Delta pull: skip MusicBrainz/Spotify calls for albums we already have ===
+if FULL_SYNC:
+    print("FULL_SYNC enabled — rebuilding metadata for every album.")
+else:
+    existing_titles = get_existing_titles()
+    is_new = ~df['Title'].str.strip().str.lower().isin(existing_titles)
+
+    # Existing albums skip enrichment entirely, but keep their rating fresh
+    # since that's the one field that changes in Notion after the fact.
+    for row in df[~is_new].itertuples():
+        supabase.table("albums").update({"rating": row.Rating}).eq("title", row.Title).execute()
+
+    skipped = len(df) - is_new.sum()
+    df = df[is_new]
+    print(f"Delta pull: {len(df)} new album(s) to enrich, {skipped} already synced (rating refreshed).")
 
 # Tip 3: track failures so we can save them at the end
 failures = []

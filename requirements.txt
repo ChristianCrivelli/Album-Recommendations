@@ -1,0 +1,7 @@
+pandas
+supabase
+musicbrainzngs
+python-dotenv
+notion-client
+scikit-learn
+numpy
