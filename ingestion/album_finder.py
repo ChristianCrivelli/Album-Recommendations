@@ -1,5 +1,6 @@
 import os
 import time
+import difflib
 import musicbrainzngs
 from dotenv import load_dotenv
  
@@ -21,6 +22,24 @@ MB_SLEEP = 1.1
 # carry far more votes than one obscure album ever gets on its own).
 TAG_FALLBACK_THRESHOLD = 3
 
+# MusicBrainz's own search ranking sometimes prioritizes an exact title match
+# over the correct artist (e.g. two different artists both released an album
+# called "$ad Boy" — search can return the wrong one as its top hit). Below
+# this combined title+artist similarity score, we treat the search as a miss
+# rather than silently attach a wrong album's metadata.
+MIN_MATCH_CONFIDENCE = 0.5
+
+
+def _similarity(a, b):
+    return difflib.SequenceMatcher(None, (a or "").lower().strip(), (b or "").lower().strip()).ratio()
+
+
+def _candidate_artist_str(rg):
+    return ", ".join(
+        c['artist']['name'] for c in rg.get('artist-credit', [])
+        if isinstance(c, dict) and 'artist' in c
+    )
+
 
 def get_artist_tags(artist_mbid):
     """Fetch an artist's own MusicBrainz tag-list, sorted by community votes.
@@ -41,20 +60,41 @@ def get_artist_tags(artist_mbid):
 def get_metadata(album_name, artist_name):
     try:
         # 1. Search for the Release Group
-        # Searching by Release Group is better for catching the "master" record
-        search = musicbrainzngs.search_release_groups(artist=artist_name, releasegroup=album_name, limit=1)
+        # Searching by Release Group is better for catching the "master" record.
+        # Fetch several candidates rather than trusting MusicBrainz's #1 result
+        # blindly — its search ranking sometimes favors an exact title match
+        # over the correct artist, which can silently attach the wrong
+        # album's metadata (e.g. two different artists both have a release
+        # called "$ad Boy" — the wrong one can rank first).
+        search = musicbrainzngs.search_release_groups(artist=artist_name, releasegroup=album_name, limit=5)
         time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
         
-        if not search.get('release-group-list'):
+        candidates = search.get('release-group-list', [])
+        if not candidates:
             return None
-            
-        rg_id = search['release-group-list'][0]['id']
+
+        scored = []
+        for rg in candidates:
+            title_score = _similarity(rg.get('title'), album_name)
+            artist_score = _similarity(_candidate_artist_str(rg), artist_name)
+            scored.append((title_score * 0.5 + artist_score * 0.5, rg))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        best_score, best_rg = scored[0]
+
+        if best_score < MIN_MATCH_CONFIDENCE:
+            print(f"No confident MusicBrainz match for {album_name} by {artist_name} (best candidate: {best_rg.get('title')} by {_candidate_artist_str(best_rg)}, score {best_score:.2f})")
+            return None
+
+        rg_id = best_rg['id']
         
         # 2. Fetch Full Release Group Data
         # Includes tags (genres/vibes), the list of specific releases (CDs, Vinyls, etc.),
-        # and artist-credit (used below as the tag-fallback source — this is a free
-        # addition to the same request, not an extra MusicBrainz call).
-        rg_data = musicbrainzngs.get_release_group_by_id(rg_id, includes=["tags", "releases", "artists"])['release-group']
+        # and artist-credits (used below as the tag/artist-fallback source — this is a
+        # free addition to the same request, not an extra MusicBrainz call).
+        # NOTE: "artists" and "artist-credits" are two different valid includes for
+        # release-group — "artists" is an unrelated subquery include and does NOT
+        # populate the artist-credit field read below. Must be "artist-credits".
+        rg_data = musicbrainzngs.get_release_group_by_id(rg_id, includes=["tags", "releases", "artist-credits"])['release-group']
         time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
         
         # --- EXTRACT HIGHER-LEVEL TAXONOMY ---
@@ -142,8 +182,8 @@ def get_metadata(album_name, artist_name):
         # is a separate cause of "Unknown artist" from the missing-mbid case
         # handled downstream in album_push_logic.py. The release-group level
         # almost always has artist-credit, and we already fetch it above
-        # (via includes=["artists"]) for the tag fallback, so this costs no
-        # extra request.
+        # (via includes=["artist-credits"]) for the tag fallback, so this
+        # costs no extra request.
         if not artist_dicts:
             rg_artist_dicts = [
                 {'name': c['artist']['name'], 'mbid': c['artist']['id']}

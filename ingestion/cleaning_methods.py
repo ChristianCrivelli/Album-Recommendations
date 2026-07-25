@@ -60,10 +60,23 @@ TAG_MAPPING = {
 TAGS_TO_REMOVE = {
     "laut.de",
     "self-titled",
-    "stars",
     "ep",
     "billboard",
 }
+
+# Substrings that mark a tag as junk regardless of what else is in the string
+# (e.g. "billboard hot 100; 2014; year end chart", "billboard hot 100 tags",
+# "ph_2_stars"). These catch chart/ranking/rating-encoded tags that embed a
+# year, chart name, or numeric prefix, which exact-match TAGS_TO_REMOVE can't.
+JUNK_SUBSTRINGS = (
+    "on cover",
+    "woechen",
+    "wochen",      # correct German spelling ("weeks") — "woechen" alone missed this
+    "weeks",
+    "chart",       # catches both "chart" and "charts", singular or plural
+    "billboard",   # catches any billboard-prefixed variant, not just the bare tag
+    "stars",       # catches "5 stars", "ph_2_stars", etc. — rating junk, not genre info
+)
 
 def clean_and_normalize_tags(tags_list):
     if not tags_list:
@@ -73,8 +86,9 @@ def clean_and_normalize_tags(tags_list):
     for tag in tags_list:
         clean_tag = str(tag).lower().strip()
         
-        # Skip junk charts/weeks tags
-        if "on cover" in clean_tag or "woechen" in clean_tag or "weeks" in clean_tag or "charts" in clean_tag:
+        # Skip junk charts/weeks/billboard tags (substring match catches variants
+        # with years or extra words baked in, e.g. "billboard hot 100; 2014; year end chart")
+        if any(junk in clean_tag for junk in JUNK_SUBSTRINGS):
             continue
 
         # Skip exact junk/non-genre tags
