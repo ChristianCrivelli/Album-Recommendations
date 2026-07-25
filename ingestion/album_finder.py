@@ -15,7 +15,29 @@ musicbrainzngs.set_useragent(
 # MusicBrainz allows 1 request/sec. We make multiple calls per album,
 # so we sleep between each one to stay safe.
 MB_SLEEP = 1.1
- 
+
+# If a release-group has fewer community tags than this, supplement with the
+# artist's own tag-list (aggregated across all their releases, so it tends to
+# carry far more votes than one obscure album ever gets on its own).
+TAG_FALLBACK_THRESHOLD = 3
+
+
+def get_artist_tags(artist_mbid):
+    """Fetch an artist's own MusicBrainz tag-list, sorted by community votes.
+    Used as a fallback when a specific release-group has few/no tags of its own."""
+    if not artist_mbid:
+        return []
+    try:
+        result = musicbrainzngs.get_artist_by_id(artist_mbid, includes=["tags"])
+        time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
+        raw_tags = result.get('artist', {}).get('tag-list', [])
+        sorted_tags = sorted(raw_tags, key=lambda x: int(x.get('count', 0)), reverse=True)
+        return [tag['name'] for tag in sorted_tags[:5]]
+    except musicbrainzngs.WebServiceError as exc:
+        print(f"MusicBrainz Error fetching artist tags for {artist_mbid}: {exc}")
+        return []
+
+
 def get_metadata(album_name, artist_name):
     try:
         # 1. Search for the Release Group
@@ -29,8 +51,10 @@ def get_metadata(album_name, artist_name):
         rg_id = search['release-group-list'][0]['id']
         
         # 2. Fetch Full Release Group Data
-        # Includes tags (genres/vibes) and the list of specific releases (CDs, Vinyls, etc.)
-        rg_data = musicbrainzngs.get_release_group_by_id(rg_id, includes=["tags", "releases"])['release-group']
+        # Includes tags (genres/vibes), the list of specific releases (CDs, Vinyls, etc.),
+        # and artist-credit (used below as the tag-fallback source — this is a free
+        # addition to the same request, not an extra MusicBrainz call).
+        rg_data = musicbrainzngs.get_release_group_by_id(rg_id, includes=["tags", "releases", "artists"])['release-group']
         time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
         
         # --- EXTRACT HIGHER-LEVEL TAXONOMY ---
@@ -41,6 +65,28 @@ def get_metadata(album_name, artist_name):
         raw_tags = rg_data.get('tag-list', [])
         sorted_tags = sorted(raw_tags, key=lambda x: int(x.get('count', 0)), reverse=True)
         top_tags = [tag['name'] for tag in sorted_tags[:5]]
+        tag_source = "release-group"
+
+        # --- FALLBACK: sparse release-group tags → supplement with artist tags ---
+        # Many lesser-known or newer releases simply never accumulate community
+        # tags on MusicBrainz. The artist entity usually has richer tag data
+        # (votes aggregated across every release), so fill gaps from there.
+        if len(top_tags) < TAG_FALLBACK_THRESHOLD:
+            rg_artist_mbids = [
+                c['artist']['id'] for c in rg_data.get('artist-credit', [])
+                if isinstance(c, dict) and 'artist' in c
+            ]
+            seen = {t.lower() for t in top_tags}
+            gained_any = False
+            for artist_mbid in rg_artist_mbids:
+                for tag in get_artist_tags(artist_mbid):
+                    if tag.lower() not in seen:
+                        top_tags.append(tag)
+                        seen.add(tag.lower())
+                        gained_any = True
+            top_tags = top_tags[:5]
+            if gained_any:
+                tag_source = "release-group+artist-fallback"
         
         # Get the original release year
         first_date = rg_data.get('first-release-date', 'Unknown')
@@ -100,6 +146,7 @@ def get_metadata(album_name, artist_name):
             "Secondary Types": secondary_types,
             "Release Year": year,
             "Top Tags": top_tags,
+            "Tag Source": tag_source,
             "Avg Track Length (Mins)": avg_track_length,
             "Labels": labels,
             "Artist MBIDs": artist_mbids,
@@ -129,13 +176,3 @@ def get_producers(release_id):
                 })
                 
     return producers
- 
-
-
-
-
-
-
-
-
-

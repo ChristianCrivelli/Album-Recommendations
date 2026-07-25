@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ingestion.pull_albums import fetch_notion_dataframe
 from ingestion.album_finder import get_metadata, get_producers
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
+from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 
 
 load_dotenv()
@@ -27,10 +28,26 @@ def get_existing_titles() -> set:
     return {row["title"].strip().lower() for row in resp.data if row.get("title")}
 
 
+# Thin wrappers binding the shared helpers to this script's supabase client,
+# so the call sites below don't change.
+def record_bad_egg(title: str, artists: str, reason: str) -> None:
+    _record_bad_egg(supabase, title, artists, reason)
+
+
+def clear_bad_eggs(title: str) -> None:
+    _clear_bad_eggs(supabase, title)
+
+
 # === Get the Data From Notion ===
 df = fetch_notion_dataframe()
 df = df[['Title', 'Artist(s)', 'Rating/10']]
 df = df.rename(columns={'Artist(s)': 'Artists', 'Rating/10': 'Rating'})
+
+# Strip stray whitespace from titles at ingestion time. Untrimmed titles used
+# to slip into Supabase, and since /api/recommend strips the incoming search
+# query but compares it against the stored title, a title like "Temporary "
+# would show up fine in autocomplete but never match on search.
+df['Title'] = df['Title'].astype(str).str.strip()
 
 # Clean the entire Artists column before looping
 df['Artists'] = df['Artists'].apply(clean_artist_list)
@@ -109,11 +126,19 @@ for row in df.itertuples():
             # Ensure we got data back before extracting the UUID
             if not album_resp.data:
                 print(f"Warning: No data returned from Supabase for {row.Title}. Check RLS policies.")
-                failures.append({"title": row.Title, "artists": search_artist, "reason": "Supabase returned no data"})
+                reason = "Supabase returned no data"
+                failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
+                record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
                 continue
                 
             album_db_id = album_resp.data[0]['id']
-            
+
+            # This title now has a real album row, so any bad-egg flags left
+            # over from a previous run (e.g. an old "MusicBrainz lookup
+            # failed") are stale. Clear them first — anything still wrong
+            # this run (e.g. a missing-mbid contributor below) gets re-flagged.
+            clear_bad_eggs(row.Title)
+
             # Loop through all contributors
             for person in contributors:
                 if person.get('mbid'):
@@ -121,26 +146,61 @@ for row in df.itertuples():
                         {"name": person['name'], "mbid": person['mbid']}, 
                         on_conflict="mbid"
                     ).execute()
-                    
-                    if person_resp.data:
-                        person_db_id = person_resp.data[0]['id']
-                        
-                        # Step 3: Create the link in the Junction Table
-                        link_data = {
-                            "album_id": album_db_id,
-                            "person_id": person_db_id,
-                            "role": person['role']
-                        }
-                        
-                        supabase.table("album_contributions").upsert(
-                            link_data, 
-                            on_conflict="album_id,person_id,role"
+                    person_db_id = person_resp.data[0]['id'] if person_resp.data else None
+                else:
+                    # No mbid from MusicBrainz for this contributor. Previously this
+                    # branch just skipped the person entirely, which is why some
+                    # albums end up showing "Unknown artist" downstream: no row in
+                    # artists, no link in album_contributions, nothing for the API
+                    # to display. Instead, link by name (find-or-create) so the
+                    # album still has a real artist attached, and flag it as a bad
+                    # egg since a name-only match could collide with a different
+                    # artist of the same name and deserves a manual look.
+                    existing = (
+                        supabase.table("artists")
+                        .select("id")
+                        .eq("name", person['name'])
+                        .limit(1)
+                        .execute()
+                    )
+                    if existing.data:
+                        person_db_id = existing.data[0]['id']
+                    else:
+                        created = supabase.table("artists").insert(
+                            {"name": person['name']}
                         ).execute()
+                        person_db_id = created.data[0]['id'] if created.data else None
+
+                    record_bad_egg(
+                        title=row.Title,
+                        artists=search_artist,
+                        reason=f"No MusicBrainz mbid for contributor '{person['name']}' ({person['role']}) — linked by name only, verify for duplicate artist rows.",
+                    )
+
+                if person_db_id:
+                    # Step 3: Create the link in the Junction Table
+                    link_data = {
+                        "album_id": album_db_id,
+                        "person_id": person_db_id,
+                        "role": person['role']
+                    }
+
+                    supabase.table("album_contributions").upsert(
+                        link_data,
+                        on_conflict="album_id,person_id,role"
+                    ).execute()
             
             # Loop through all tags
             raw_tags = meta.get('Top Tags', [])
 
             top_tags = clean_and_normalize_tags(raw_tags)
+
+            if not top_tags:
+                record_bad_egg(
+                    title=row.Title,
+                    artists=search_artist,
+                    reason="No tags found from MusicBrainz release-group or artist fallback — needs a manual tag override.",
+                )
 
             for tag_name in top_tags:
                 # Upsert the tag into a 'tags' table
@@ -167,17 +227,25 @@ for row in df.itertuples():
             
         except Exception as e:
             print(f"Database error for {row.Title}: {e}")
-            failures.append({"title": row.Title, "artists": search_artist, "reason": f"DB error: {e}"})
+            reason = f"DB error: {e}"
+            failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
+            record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
 
     else:
         print(f"Could not find MusicBrainz data for {row.Title}")
         # Tip 3: record the failure with a reason so it's easy to investigate
-        failures.append({"title": row.Title, "artists": search_artist, "reason": "MusicBrainz lookup failed"})
+        reason = "MusicBrainz lookup failed"
+        failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
+        record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
 
-# Tip 3: write all failures to a CSV after the run completes
+# Tip 3: the CSV is kept as a local run artifact for convenience, but it lives
+# on the GitHub Actions runner's disk and is destroyed when the job ends —
+# it's not actually a durable record. The Supabase failed_lookups table
+# (populated via record_bad_egg above, as failures happen) is now the source
+# of truth Chris can check any time: `SELECT * FROM open_bad_eggs;`
 if failures:
     failures_df = pd.DataFrame(failures)
     failures_df.to_csv("failed_lookups.csv", index=False)
-    print(f"\nDone! {len(failures)} album(s) failed — saved to failed_lookups.csv")
+    print(f"\nDone! {len(failures)} album(s) failed — saved to Supabase failed_lookups table (and failed_lookups.csv locally).")
 else:
     print("\nDone! All albums processed successfully.")
