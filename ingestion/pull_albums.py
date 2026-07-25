@@ -44,7 +44,17 @@ def fetch_notion_dataframe():
     for page in results:
         props = page["properties"]
         row = {}
-        
+
+        # Page-level metadata (not a property): Notion's own record of when
+        # this entry was actually created/edited by Chris. This is what
+        # "recently added/edited" should be based on — Supabase's own
+        # created_at/updated_at only reflect when the pipeline happened to
+        # process the row, which can lag well behind (or diverge from) the
+        # real Notion edit history, especially for anything that took a
+        # few retries to resolve.
+        row['NotionCreatedAt'] = page.get('created_time')
+        row['NotionEditedAt'] = page.get('last_edited_time')
+
         for col_name, col_data in props.items():
             type = col_data["type"]
             

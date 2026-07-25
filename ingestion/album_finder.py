@@ -136,6 +136,24 @@ def get_metadata(album_name, artist_name):
                             'name': c['artist']['name'],
                             'mbid': c['artist']['id']
                         })
+
+        # Fallback: the specific release sometimes has no artist-credit data
+        # at all (not just a missing mbid — the whole block absent), which
+        # is a separate cause of "Unknown artist" from the missing-mbid case
+        # handled downstream in album_push_logic.py. The release-group level
+        # almost always has artist-credit, and we already fetch it above
+        # (via includes=["artists"]) for the tag fallback, so this costs no
+        # extra request.
+        if not artist_dicts:
+            rg_artist_dicts = [
+                {'name': c['artist']['name'], 'mbid': c['artist']['id']}
+                for c in rg_data.get('artist-credit', [])
+                if isinstance(c, dict) and 'artist' in c
+            ]
+            if rg_artist_dicts:
+                artist_dicts = rg_artist_dicts
+                if not artist_mbids:
+                    artist_mbids = [a['mbid'] for a in rg_artist_dicts if a.get('mbid')]
                 
         # 3. Return the compiled feature vector
         print(f"Found data for {album_name} by {artist_name}")

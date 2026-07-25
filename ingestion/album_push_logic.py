@@ -40,7 +40,7 @@ def clear_bad_eggs(title: str) -> None:
 
 # === Get the Data From Notion ===
 df = fetch_notion_dataframe()
-df = df[['Title', 'Artist(s)', 'Rating/10']]
+df = df[['Title', 'Artist(s)', 'Rating/10', 'NotionCreatedAt', 'NotionEditedAt']]
 df = df.rename(columns={'Artist(s)': 'Artists', 'Rating/10': 'Rating'})
 
 # Strip stray whitespace from titles at ingestion time. Untrimmed titles used
@@ -61,10 +61,18 @@ else:
     existing_titles = get_existing_titles()
     is_new = ~df['Title'].str.strip().str.lower().isin(existing_titles)
 
-    # Existing albums skip enrichment entirely, but keep their rating fresh
-    # since that's the one field that changes in Notion after the fact.
+    # Existing albums skip enrichment entirely, but keep their rating and
+    # Notion timestamps fresh — rating and last_edited_time are the two
+    # things that change in Notion after the fact. Sending notion_created_at
+    # here too (harmless — it never actually changes) is what backfills it
+    # onto any album row that existed before this feature, automatically,
+    # on the very next run — no separate migration/backfill script needed.
     for row in df[~is_new].itertuples():
-        supabase.table("albums").update({"rating": row.Rating}).eq("title", row.Title).execute()
+        supabase.table("albums").update({
+            "rating": row.Rating,
+            "notion_created_at": row.NotionCreatedAt,
+            "notion_edited_at": row.NotionEditedAt,
+        }).eq("title", row.Title).execute()
 
     skipped = len(df) - is_new.sum()
     df = df[is_new]
@@ -95,6 +103,8 @@ for row in df.itertuples():
             "primary_type": meta.get('Primary Type'),
             "release_year": meta.get('Release Year'),
             "avg_length": meta.get('Avg Track Length (Mins)'),
+            "notion_created_at": row.NotionCreatedAt,
+            "notion_edited_at": row.NotionEditedAt,
         }
 
         # Entities B & C (Contributors)
