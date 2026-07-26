@@ -43,6 +43,17 @@ df = fetch_notion_dataframe()
 df = df[['Title', 'Artist(s)', 'Rating/10', 'NotionCreatedAt', 'NotionEditedAt']]
 df = df.rename(columns={'Artist(s)': 'Artists', 'Rating/10': 'Rating'})
 
+# Notion rows with a blank Title can't be searched, matched, or stored
+# meaningfully (title is the primary key used throughout this pipeline) —
+# drop them up front. Without this, a NaN title survives astype(str) (pandas
+# deliberately does NOT stringify NaN — it's preserved as a float, not
+# coerced to the string "nan") and crashes downstream string operations,
+# taking the entire batch down with it rather than just that one row.
+missing_title = df['Title'].isna()
+if missing_title.any():
+    print(f"Warning: {int(missing_title.sum())} row(s) in Notion have a blank Title — skipping. Check your Notion database for empty rows.")
+    df = df[~missing_title].copy()
+
 # Strip stray whitespace from titles at ingestion time. Untrimmed titles used
 # to slip into Supabase, and since /api/recommend strips the incoming search
 # query but compares it against the stored title, a title like "Temporary "
@@ -86,53 +97,54 @@ n = 1
 for row in df.itertuples():
     print(f"--- Processing N.{n}: {row.Title} ---")
     n += 1
+    search_artist = ""  # available in the except block below even if we fail before it's set
 
-    # 1. Get metadata
-    search_artist = ", ".join(row.Artists)
-    meta = get_metadata(row.Title, search_artist)
+    try:
+        # 1. Get metadata
+        search_artist = ", ".join(row.Artists)
+        meta = get_metadata(row.Title, search_artist)
 
-    # 2. Insert/Get Artist ID
-    if meta and meta.get('Release ID'): 
-        release_id = meta['Release ID']
+        # 2. Insert/Get Artist ID
+        if meta and meta.get('Release ID'):
+            release_id = meta['Release ID']
 
-        # Entity A (Album)
-        album_data = {
-            "title": row.Title,
-            "mbid": release_id,
-            "rating": row.Rating,
-            "primary_type": meta.get('Primary Type'),
-            "release_year": meta.get('Release Year'),
-            "avg_length": meta.get('Avg Track Length (Mins)'),
-            "notion_created_at": row.NotionCreatedAt,
-            "notion_edited_at": row.NotionEditedAt,
-        }
+            # Entity A (Album)
+            album_data = {
+                "title": row.Title,
+                "mbid": release_id,
+                "rating": row.Rating,
+                "primary_type": meta.get('Primary Type'),
+                "release_year": meta.get('Release Year'),
+                "avg_length": meta.get('Avg Track Length (Mins)'),
+                "notion_created_at": row.NotionCreatedAt,
+                "notion_edited_at": row.NotionEditedAt,
+            }
 
-        # Entities B & C (Contributors)
-        producers = get_producers(release_id)
-        contributors = []
-        
-        for artist in meta.get('Artists', []):
-            contributors.append({
-                'name': artist['name'],
-                'mbid': artist['mbid'],
-                'role': 'artist'
-            })
+            # Entities B & C (Contributors)
+            producers = get_producers(release_id)
+            contributors = []
 
-        for prod in producers:
-            contributors.append({
-                'name': prod['name'],
-                'mbid': prod['mbid'],
-                'role': 'producer'
-            })
-        
-        # Push into Supabase
-        try:
+            for artist in meta.get('Artists', []):
+                contributors.append({
+                    'name': artist['name'],
+                    'mbid': artist['mbid'],
+                    'role': 'artist'
+                })
+
+            for prod in producers:
+                contributors.append({
+                    'name': prod['name'],
+                    'mbid': prod['mbid'],
+                    'role': 'producer'
+                })
+
+            # Push into Supabase
             # Upsert Album
             album_resp = supabase.table("albums").upsert(
-                album_data, 
+                album_data,
                 on_conflict="mbid"
             ).execute()
-            
+
             # Ensure we got data back before extracting the UUID
             if not album_resp.data:
                 print(f"Warning: No data returned from Supabase for {row.Title}. Check RLS policies.")
@@ -140,7 +152,7 @@ for row in df.itertuples():
                 failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
                 record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
                 continue
-                
+
             album_db_id = album_resp.data[0]['id']
 
             # This title now has a real album row, so any bad-egg flags left
@@ -153,7 +165,7 @@ for row in df.itertuples():
             for person in contributors:
                 if person.get('mbid'):
                     person_resp = supabase.table("artists").upsert(
-                        {"name": person['name'], "mbid": person['mbid']}, 
+                        {"name": person['name'], "mbid": person['mbid']},
                         on_conflict="mbid"
                     ).execute()
                     person_db_id = person_resp.data[0]['id'] if person_resp.data else None
@@ -199,7 +211,7 @@ for row in df.itertuples():
                         link_data,
                         on_conflict="album_id,person_id,role"
                     ).execute()
-            
+
             # Loop through all tags
             raw_tags = meta.get('Top Tags', [])
 
@@ -215,38 +227,45 @@ for row in df.itertuples():
             for tag_name in top_tags:
                 # Upsert the tag into a 'tags' table
                 tag_resp = supabase.table("tags").upsert(
-                    {"name": tag_name}, 
+                    {"name": tag_name},
                     on_conflict="name" # Assumes 'name' is unique in your tags table
                 ).execute()
-                
+
                 if tag_resp.data:
                     tag_db_id = tag_resp.data[0]['id']
-                    
+
                     # Create the link in the Tag Junction Table
                     tag_link_data = {
                         "album_id": album_db_id,
                         "tag_id": tag_db_id
                     }
-                    
+
                     supabase.table("album_tags").upsert(
-                        tag_link_data, 
+                        tag_link_data,
                         on_conflict="album_id,tag_id"
                     ).execute()
 
             print(f"Success! Added {len(contributors)} contributors and {len(top_tags)} tags.")
-            
-        except Exception as e:
-            print(f"Database error for {row.Title}: {e}")
-            reason = f"DB error: {e}"
+
+        else:
+            print(f"Could not find MusicBrainz data for {row.Title}")
+            # Tip 3: record the failure with a reason so it's easy to investigate
+            reason = "MusicBrainz lookup failed"
             failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
             record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
 
-    else:
-        print(f"Could not find MusicBrainz data for {row.Title}")
-        # Tip 3: record the failure with a reason so it's easy to investigate
-        reason = "MusicBrainz lookup failed"
+    except Exception as e:
+        # Safety net: nothing that happens while processing a single album —
+        # a MusicBrainz quirk, a malformed Notion row, a Supabase hiccup,
+        # anything unanticipated — should be able to crash the whole run and
+        # silently skip every remaining album in the batch (this is exactly
+        # what happened with a blank-title row: it took down all 199 new
+        # albums in that run, not just itself). Log it, flag it, move on.
+        print(f"Unexpected error processing {row.Title}: {e}")
+        reason = f"Unexpected error: {e}"
         failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
-        record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
+        record_bad_egg(title=str(row.Title), artists=str(search_artist), reason=reason)
+        continue
 
 # Tip 3: the CSV is kept as a local run artifact for convenience, but it lives
 # on the GitHub Actions runner's disk and is destroyed when the job ends —
