@@ -29,6 +29,34 @@ TAG_FALLBACK_THRESHOLD = 3
 # rather than silently attach a wrong album's metadata.
 MIN_MATCH_CONFIDENCE = 0.5
 
+# Transient network hiccups (connection resets, timeouts, momentary 5xx from
+# MusicBrainz) surface as musicbrainzngs.WebServiceError, identically to a
+# genuine "this doesn't exist" response. Previously a single blip on ANY of
+# the several calls get_metadata makes was enough to mark a well-known,
+# definitely-indexed album (e.g. "Eternal Atake", "WUNNA") as unfindable.
+# Retrying a couple of times before giving up filters most of that noise out.
+MB_MAX_ATTEMPTS = 3
+MB_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
+
+
+def _mb_call(fn, *args, **kwargs):
+    """Call a musicbrainzngs function, retrying on transient WebServiceError.
+    Sleeps MB_SLEEP after every attempt (success or failure) to respect the
+    1 request/sec limit, then re-raises the last error if all attempts fail."""
+    last_exc = None
+    for attempt in range(1, MB_MAX_ATTEMPTS + 1):
+        try:
+            result = fn(*args, **kwargs)
+            time.sleep(MB_SLEEP)
+            return result
+        except musicbrainzngs.WebServiceError as exc:
+            last_exc = exc
+            time.sleep(MB_SLEEP)
+            if attempt < MB_MAX_ATTEMPTS:
+                print(f"MusicBrainz call failed (attempt {attempt}/{MB_MAX_ATTEMPTS}): {exc} — retrying...")
+                time.sleep(MB_RETRY_BACKOFF * attempt)
+    raise last_exc
+
 
 def _similarity(a, b):
     return difflib.SequenceMatcher(None, (a or "").lower().strip(), (b or "").lower().strip()).ratio()
@@ -47,8 +75,7 @@ def get_artist_tags(artist_mbid):
     if not artist_mbid:
         return []
     try:
-        result = musicbrainzngs.get_artist_by_id(artist_mbid, includes=["tags"])
-        time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
+        result = _mb_call(musicbrainzngs.get_artist_by_id, artist_mbid, includes=["tags"])
         raw_tags = result.get('artist', {}).get('tag-list', [])
         sorted_tags = sorted(raw_tags, key=lambda x: int(x.get('count', 0)), reverse=True)
         return [tag['name'] for tag in sorted_tags[:5]]
@@ -58,6 +85,11 @@ def get_artist_tags(artist_mbid):
 
 
 def get_metadata(album_name, artist_name):
+    """Returns (metadata_dict, reason). On success, metadata_dict is populated
+    and reason is None. On failure, metadata_dict is None and reason is a
+    human-readable string distinguishing *why* — no candidates found, no
+    confident match, or a MusicBrainz API/network error — instead of the old
+    behavior where all three collapsed into an indistinguishable None."""
     try:
         # 1. Search for the Release Group
         # Searching by Release Group is better for catching the "master" record.
@@ -66,12 +98,11 @@ def get_metadata(album_name, artist_name):
         # over the correct artist, which can silently attach the wrong
         # album's metadata (e.g. two different artists both have a release
         # called "$ad Boy" — the wrong one can rank first).
-        search = musicbrainzngs.search_release_groups(artist=artist_name, releasegroup=album_name, limit=5)
-        time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
-        
+        search = _mb_call(musicbrainzngs.search_release_groups, artist=artist_name, releasegroup=album_name, limit=5)
+
         candidates = search.get('release-group-list', [])
         if not candidates:
-            return None
+            return None, "No MusicBrainz release-group candidates found for this title/artist"
 
         scored = []
         for rg in candidates:
@@ -82,8 +113,13 @@ def get_metadata(album_name, artist_name):
         best_score, best_rg = scored[0]
 
         if best_score < MIN_MATCH_CONFIDENCE:
-            print(f"No confident MusicBrainz match for {album_name} by {artist_name} (best candidate: {best_rg.get('title')} by {_candidate_artist_str(best_rg)}, score {best_score:.2f})")
-            return None
+            reason = (
+                f"No confident MusicBrainz match (best candidate: '{best_rg.get('title')}' "
+                f"by {_candidate_artist_str(best_rg)}, score {best_score:.2f} < {MIN_MATCH_CONFIDENCE}) "
+                f"— check for a typo in the title/artist, or the release may need a manual MBID override"
+            )
+            print(f"{reason} [{album_name} by {artist_name}]")
+            return None, reason
 
         rg_id = best_rg['id']
         
@@ -94,8 +130,7 @@ def get_metadata(album_name, artist_name):
         # NOTE: "artists" and "artist-credits" are two different valid includes for
         # release-group — "artists" is an unrelated subquery include and does NOT
         # populate the artist-credit field read below. Must be "artist-credits".
-        rg_data = musicbrainzngs.get_release_group_by_id(rg_id, includes=["tags", "releases", "artist-credits"])['release-group']
-        time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
+        rg_data = _mb_call(musicbrainzngs.get_release_group_by_id, rg_id, includes=["tags", "releases", "artist-credits"])['release-group']
         
         # --- EXTRACT HIGHER-LEVEL TAXONOMY ---
         primary_type = rg_data.get('primary-type', 'Unknown')
@@ -144,8 +179,7 @@ def get_metadata(album_name, artist_name):
             release_id = rg_data['release-list'][0]['id']
             
             # Fetch the specific release including tracks, labels, and artist credits
-            release_data = musicbrainzngs.get_release_by_id(release_id, includes=["recordings", "labels", "artist-credits"])['release']
-            time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
+            release_data = _mb_call(musicbrainzngs.get_release_by_id, release_id, includes=["recordings", "labels", "artist-credits"])['release']
             
             # Extract Labels
             if 'label-info-list' in release_data:
@@ -208,18 +242,36 @@ def get_metadata(album_name, artist_name):
             "Avg Track Length (Mins)": avg_track_length,
             "Labels": labels,
             "Artist MBIDs": artist_mbids,
+            # The release-GROUP id is stable across runs — it identifies
+            # "the album" itself, unrelated to which specific edition/
+            # pressing MusicBrainz happens to return first. This is what
+            # should be persisted as the durable identifier (see
+            # album_push_logic.py). Release ID (below) is still needed for
+            # this run's track/label lookups and get_producers(), but is
+            # NOT safe to treat as a stable per-album key — MusicBrainz
+            # doesn't guarantee release-list ordering is the same between
+            # calls, so re-processing the same album (e.g. the monthly
+            # FULL_SYNC deep sync) could previously land on a different
+            # release each time, producing a different "mbid" and causing
+            # the same album to be inserted as a brand new row every run.
+            "Release Group ID": rg_id,
             "Release ID": release_id,
             "Artists": artist_dicts  
-        }
+        }, None
         
     except musicbrainzngs.WebServiceError as exc:
-        print(f"MusicBrainz Error for {album_name}: {exc}")
-        return None
-    
+        # Reached MB_MAX_ATTEMPTS retries in _mb_call without success — this
+        # is very likely a transient network/API issue, not a genuine "not
+        # found". Surface the real exception text instead of a generic
+        # "lookup failed" so it's distinguishable in failed_lookups and worth
+        # a re-run rather than manual research.
+        reason = f"MusicBrainz API error after {MB_MAX_ATTEMPTS} attempts: {exc}"
+        print(f"{reason} [{album_name} by {artist_name}]")
+        return None, reason
+
 def get_producers(release_id):
-    result = musicbrainzngs.get_release_by_id(release_id, includes=["artist-rels"])
-    time.sleep(MB_SLEEP)  # Tip 5: sleep after every MB request
-    
+    result = _mb_call(musicbrainzngs.get_release_by_id, release_id, includes=["artist-rels"])
+
     producers = []
     
     # Look through the relationships for this release

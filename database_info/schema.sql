@@ -42,3 +42,17 @@ CREATE TABLE public.tags (
   created_at timestamp with time zone NOT NULL DEFAULT timezone('utc'::text, now()),
   CONSTRAINT tags_pkey PRIMARY KEY (id)
 );
+CREATE TABLE public.manual_overrides (
+  title text NOT NULL,
+  search_title text,
+  search_artist text,
+  skip_musicbrainz boolean NOT NULL DEFAULT false,
+  manual_primary_type text,
+  manual_release_year text,
+  manual_avg_length numeric,
+  manual_tags text[],
+  manual_artist_names text[],
+  notes text,
+  created_at timestamp with time zone NOT NULL DEFAULT timezone('utc'::text, now()),
+  CONSTRAINT manual_overrides_pkey PRIMARY KEY (title)
+);

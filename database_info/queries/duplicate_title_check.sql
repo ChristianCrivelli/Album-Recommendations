@@ -10,7 +10,7 @@ FROM albums a
 JOIN album_contributions ac ON ac.album_id = a.id
 JOIN artists ar ON ar.id = ac.person_id
 WHERE a.id = '<album_id_to_check>';
-z
+
 --Once you've identified the wrong row's id, delete it (junction rows first for the FK constraints, same pattern as tag_cleanup.sql):
 DELETE FROM album_contributions WHERE album_id = '<wrong_id>';
 DELETE FROM album_tags WHERE album_id = '<wrong_id>';

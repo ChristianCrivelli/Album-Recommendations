@@ -9,6 +9,7 @@ from ingestion.pull_albums import fetch_notion_dataframe
 from ingestion.album_finder import get_metadata, get_producers
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
+from ingestion.manual_overrides import get_override
 
 
 load_dotenv()
@@ -100,9 +101,22 @@ for row in df.itertuples():
     search_artist = ""  # available in the except block below even if we fail before it's set
 
     try:
+        # 0. Check for a manual override before touching MusicBrainz at all —
+        # see database_info/migrations/manual_overrides.sql for the two modes.
+        override = get_override(supabase, row.Title)
+
         # 1. Get metadata
         search_artist = ", ".join(row.Artists)
-        meta = get_metadata(row.Title, search_artist)
+
+        if override and override.get("skip_musicbrainz"):
+            # Full-manual mode: never call MusicBrainz for this title.
+            meta, mb_reason = None, None
+        else:
+            # Search-hint mode (or no override at all): use the corrected
+            # title/artist if one was provided, otherwise the Notion values.
+            search_title = (override.get("search_title") if override else None) or row.Title
+            search_artist_query = (override.get("search_artist") if override else None) or search_artist
+            meta, mb_reason = get_metadata(search_title, search_artist_query)
 
         # 2. Insert/Get Artist ID
         if meta and meta.get('Release ID'):
@@ -111,7 +125,11 @@ for row in df.itertuples():
             # Entity A (Album)
             album_data = {
                 "title": row.Title,
-                "mbid": release_id,
+                # Release-GROUP id, not release id — see the comment on
+                # "Release Group ID" in album_finder.py for why this
+                # distinction matters (it's what keeps this upsert stable
+                # across repeated runs of the same album).
+                "mbid": meta.get('Release Group ID'),
                 "rating": row.Rating,
                 "primary_type": meta.get('Primary Type'),
                 "release_year": meta.get('Release Year'),
@@ -139,7 +157,17 @@ for row in df.itertuples():
                 })
 
             # Push into Supabase
-            # Upsert Album
+            # Upsert Album — keyed on mbid, which now stores the stable
+            # release-GROUP id (see the comment on "Release Group ID" in
+            # album_finder.py) rather than a specific release id. A
+            # release-group id is MusicBrainz's canonical identifier for
+            # one particular album by one particular artist, so this both
+            # (a) survives repeated runs without spawning duplicate rows,
+            # and (b) correctly keeps two different artists' same-titled
+            # albums as separate rows, since their release-group ids
+            # differ. Keying on title instead would break that second
+            # case — two real different albums sharing a name would
+            # collide into one row.
             album_resp = supabase.table("albums").upsert(
                 album_data,
                 on_conflict="mbid"
@@ -247,10 +275,85 @@ for row in df.itertuples():
 
             print(f"Success! Added {len(contributors)} contributors and {len(top_tags)} tags.")
 
+        elif override and override.get("skip_musicbrainz"):
+            # Full-manual path: no MusicBrainz data exists or will ever be
+            # sought for this title. Store whatever Chris entered in
+            # manual_overrides directly, with mbid left NULL.
+            print(f"Using manual override for {row.Title} (skipping MusicBrainz).")
+
+            album_data = {
+                "title": row.Title,
+                "mbid": None,
+                "rating": row.Rating,
+                "primary_type": override.get("manual_primary_type"),
+                "release_year": override.get("manual_release_year"),
+                "avg_length": override.get("manual_avg_length"),
+                "notion_created_at": row.NotionCreatedAt,
+                "notion_edited_at": row.NotionEditedAt,
+            }
+
+            # A NULL mbid never "conflicts" with anything under Postgres
+            # uniqueness rules, so on_conflict="mbid" would insert a fresh
+            # duplicate album row on every single re-run. Find-or-update by
+            # title instead — title is already this pipeline's de facto
+            # unique key for any album without an mbid.
+            existing_album = supabase.table("albums").select("id").eq("title", row.Title).limit(1).execute()
+            if existing_album.data:
+                album_db_id = existing_album.data[0]['id']
+                supabase.table("albums").update(album_data).eq("id", album_db_id).execute()
+            else:
+                created_album = supabase.table("albums").insert(album_data).execute()
+                if not created_album.data:
+                    print(f"Warning: No data returned from Supabase for {row.Title}. Check RLS policies.")
+                    reason = "Supabase returned no data (manual override insert)"
+                    failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
+                    record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
+                    continue
+                album_db_id = created_album.data[0]['id']
+
+            clear_bad_eggs(row.Title)
+
+            # Contributors: name-only, since no MBIDs exist for these by
+            # definition. Wipe old artist links first so re-running replaces
+            # rather than accumulates duplicates if manual_artist_names changes.
+            supabase.table("album_contributions").delete().eq("album_id", album_db_id).eq("role", "artist").execute()
+            manual_artist_names = override.get("manual_artist_names") or row.Artists
+            for name in manual_artist_names:
+                existing_artist = supabase.table("artists").select("id").eq("name", name).limit(1).execute()
+                if existing_artist.data:
+                    person_db_id = existing_artist.data[0]['id']
+                else:
+                    created_artist = supabase.table("artists").insert({"name": name}).execute()
+                    person_db_id = created_artist.data[0]['id'] if created_artist.data else None
+
+                if person_db_id:
+                    supabase.table("album_contributions").upsert(
+                        {"album_id": album_db_id, "person_id": person_db_id, "role": "artist"},
+                        on_conflict="album_id,person_id,role"
+                    ).execute()
+
+            # Tags: wipe and re-add from manual_tags for the same reason.
+            supabase.table("album_tags").delete().eq("album_id", album_db_id).execute()
+            top_tags = clean_and_normalize_tags(override.get("manual_tags") or [])
+            for tag_name in top_tags:
+                tag_resp = supabase.table("tags").upsert({"name": tag_name}, on_conflict="name").execute()
+                if tag_resp.data:
+                    tag_db_id = tag_resp.data[0]['id']
+                    supabase.table("album_tags").upsert(
+                        {"album_id": album_db_id, "tag_id": tag_db_id},
+                        on_conflict="album_id,tag_id"
+                    ).execute()
+
+            print(f"Success (manual)! Added {len(manual_artist_names)} contributor(s) and {len(top_tags)} tag(s).")
+
         else:
             print(f"Could not find MusicBrainz data for {row.Title}")
-            # Tip 3: record the failure with a reason so it's easy to investigate
-            reason = "MusicBrainz lookup failed"
+            # Tip 3: record the failure with a reason so it's easy to investigate.
+            # mb_reason now distinguishes "no candidates" / "low-confidence match"
+            # / "API error after retries" instead of one generic string, so it's
+            # obvious from failed_lookups.csv alone whether an album needs a
+            # title fix, a manual MBID override, or is just worth re-running.
+            reason = mb_reason or "MusicBrainz lookup failed"
             failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
             record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
 
