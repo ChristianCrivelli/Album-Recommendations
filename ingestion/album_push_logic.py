@@ -245,33 +245,48 @@ for row in df.itertuples():
 
             top_tags = clean_and_normalize_tags(raw_tags)
 
-            if not top_tags:
+            if top_tags:
+                # Substitute, don't just accumulate: if this album already has
+                # tags (e.g. a manually-added placeholder from a period when
+                # MusicBrainz had nothing, or stale tags from a prior wrong-
+                # artist match), a fresh non-empty result from MusicBrainz is
+                # taken as authoritative and replaces them outright. Without
+                # this, placeholder/stale tags linger forever — upsert only
+                # ever adds new album_tags links, it never removes old ones,
+                # so a real tag arriving later just sits next to a leftover
+                # placeholder instead of superseding it.
+                supabase.table("album_tags").delete().eq("album_id", album_db_id).execute()
+
+                for tag_name in top_tags:
+                    # Upsert the tag into a 'tags' table
+                    tag_resp = supabase.table("tags").upsert(
+                        {"name": tag_name},
+                        on_conflict="name" # Assumes 'name' is unique in your tags table
+                    ).execute()
+
+                    if tag_resp.data:
+                        tag_db_id = tag_resp.data[0]['id']
+
+                        # Create the link in the Tag Junction Table
+                        tag_link_data = {
+                            "album_id": album_db_id,
+                            "tag_id": tag_db_id
+                        }
+
+                        supabase.table("album_tags").upsert(
+                            tag_link_data,
+                            on_conflict="album_id,tag_id"
+                        ).execute()
+            else:
+                # No tags found this run — leave whatever's already linked
+                # (placeholder or otherwise) alone rather than wiping it out
+                # over a transient MusicBrainz gap. Just flag it so it stays
+                # visible as still needing attention.
                 record_bad_egg(
                     title=row.Title,
                     artists=search_artist,
                     reason="No tags found from MusicBrainz release-group or artist fallback — needs a manual tag override.",
                 )
-
-            for tag_name in top_tags:
-                # Upsert the tag into a 'tags' table
-                tag_resp = supabase.table("tags").upsert(
-                    {"name": tag_name},
-                    on_conflict="name" # Assumes 'name' is unique in your tags table
-                ).execute()
-
-                if tag_resp.data:
-                    tag_db_id = tag_resp.data[0]['id']
-
-                    # Create the link in the Tag Junction Table
-                    tag_link_data = {
-                        "album_id": album_db_id,
-                        "tag_id": tag_db_id
-                    }
-
-                    supabase.table("album_tags").upsert(
-                        tag_link_data,
-                        on_conflict="album_id,tag_id"
-                    ).execute()
 
             print(f"Success! Added {len(contributors)} contributors and {len(top_tags)} tags.")
 
