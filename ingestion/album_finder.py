@@ -29,6 +29,13 @@ TAG_FALLBACK_THRESHOLD = 3
 # rather than silently attach a wrong album's metadata.
 MIN_MATCH_CONFIDENCE = 0.5
 
+# Structural loophole fix: MIN_MATCH_CONFIDENCE is a *weighted average*, so a
+# near-perfect title match can single-handedly clear it even when the artist
+# is completely wrong. The combined score alone can't catch that — the artist
+# has to independently clear its own floor too. Starting conservative; tune
+# against real wrong-artist examples in failed_lookups if this over/under-fires.
+MIN_ARTIST_SCORE = 0.4
+
 # Transient network hiccups (connection resets, timeouts, momentary 5xx from
 # MusicBrainz) surface as musicbrainzngs.WebServiceError, identically to a
 # genuine "this doesn't exist" response. Previously a single blip on ANY of
@@ -108,15 +115,28 @@ def get_metadata(album_name, artist_name):
         for rg in candidates:
             title_score = _similarity(rg.get('title'), album_name)
             artist_score = _similarity(_candidate_artist_str(rg), artist_name)
-            scored.append((title_score * 0.5 + artist_score * 0.5, rg))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        best_score, best_rg = scored[0]
+            combined_score = title_score * 0.5 + artist_score * 0.5
+            scored.append((combined_score, artist_score, rg))
+        scored.sort(key=lambda tup: tup[0], reverse=True)
+        best_score, best_artist_score, best_rg = scored[0]
 
         if best_score < MIN_MATCH_CONFIDENCE:
             reason = (
                 f"No confident MusicBrainz match (best candidate: '{best_rg.get('title')}' "
                 f"by {_candidate_artist_str(best_rg)}, score {best_score:.2f} < {MIN_MATCH_CONFIDENCE}) "
                 f"— check for a typo in the title/artist, or the release may need a manual MBID override"
+            )
+            print(f"{reason} [{album_name} by {artist_name}]")
+            return None, reason
+
+        # See MIN_ARTIST_SCORE above: a strong title match can't compensate for
+        # a weak artist match. Catches the case a bare combined-score check misses.
+        if best_artist_score < MIN_ARTIST_SCORE:
+            reason = (
+                f"No confident MusicBrainz match (best candidate: '{best_rg.get('title')}' "
+                f"by {_candidate_artist_str(best_rg)}, artist score {best_artist_score:.2f} < {MIN_ARTIST_SCORE}, "
+                f"combined score {best_score:.2f}) — title matched well but the artist didn't; "
+                f"likely a different artist's same-titled release, or needs a manual MBID override"
             )
             print(f"{reason} [{album_name} by {artist_name}]")
             return None, reason
