@@ -24,9 +24,22 @@ supabase: Client = create_client(url, key)
 FULL_SYNC = os.getenv("FULL_SYNC", "false").strip().lower() == "true"
 
 
-def get_existing_titles() -> set:
-    resp = supabase.table("albums").select("title").execute()
-    return {row["title"].strip().lower() for row in resp.data if row.get("title")}
+def get_existing_album_ids() -> dict:
+    """Maps lower-cased title -> primary key id for every album already in
+    Supabase. Used to batch the nightly rating/timestamp refresh via a single
+    upsert keyed on id (the primary key, so no new unique constraint is
+    needed) instead of one UPDATE ... WHERE title = ... round-trip per row."""
+    resp = supabase.table("albums").select("id, title").execute()
+    return {
+        row["title"].strip().lower(): row["id"]
+        for row in resp.data
+        if row.get("title") and row.get("id")
+    }
+
+
+def _chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 # Thin wrappers binding the shared helpers to this script's supabase client,
@@ -70,8 +83,8 @@ print(f"Loaded {len(df)} albums from Notion.")
 if FULL_SYNC:
     print("FULL_SYNC enabled — rebuilding metadata for every album.")
 else:
-    existing_titles = get_existing_titles()
-    is_new = ~df['Title'].str.strip().str.lower().isin(existing_titles)
+    existing_album_ids = get_existing_album_ids()
+    is_new = ~df['Title'].str.strip().str.lower().isin(existing_album_ids.keys())
 
     # Existing albums skip enrichment entirely, but keep their rating and
     # Notion timestamps fresh — rating and last_edited_time are the two
@@ -79,16 +92,30 @@ else:
     # here too (harmless — it never actually changes) is what backfills it
     # onto any album row that existed before this feature, automatically,
     # on the very next run — no separate migration/backfill script needed.
-    for row in df[~is_new].itertuples():
-        supabase.table("albums").update({
+    #
+    # This used to be one supabase.table("albums").update(...).eq("title", ...)
+    # call per already-synced row — 1,000+ sequential network round-trips a
+    # night with ~1,174 albums, and the main reason the pipeline took
+    # 35-65 minutes even with zero/few new albums. Batched into a single
+    # upsert keyed on id (the primary key, so it works without a new unique
+    # constraint on title) instead, chunked at 500 rows/request to stay
+    # under any request payload limit.
+    refresh_records = [
+        {
+            "id": existing_album_ids[row.Title.strip().lower()],
             "rating": row.Rating,
             "notion_created_at": row.NotionCreatedAt,
             "notion_edited_at": row.NotionEditedAt,
-        }).eq("title", row.Title).execute()
+        }
+        for row in df[~is_new].itertuples()
+    ]
 
-    skipped = len(df) - is_new.sum()
+    for chunk in _chunked(refresh_records, 500):
+        supabase.table("albums").upsert(chunk, on_conflict="id").execute()
+
+    skipped = len(refresh_records)
     df = df[is_new]
-    print(f"Delta pull: {len(df)} new album(s) to enrich, {skipped} already synced (rating refreshed).")
+    print(f"Delta pull: {len(df)} new album(s) to enrich, {skipped} already synced (rating refreshed in {max(1, -(-skipped // 500)) if skipped else 0} batch(es)).")
 
 # Tip 3: track failures so we can save them at the end
 failures = []
