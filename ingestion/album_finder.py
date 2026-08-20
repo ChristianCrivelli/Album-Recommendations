@@ -24,17 +24,22 @@ TAG_FALLBACK_THRESHOLD = 3
 
 # MusicBrainz's own search ranking sometimes prioritizes an exact title match
 # over the correct artist (e.g. two different artists both released an album
-# called "$ad Boy" — search can return the wrong one as its top hit). Below
-# this combined title+artist similarity score, we treat the search as a miss
-# rather than silently attach a wrong album's metadata.
-MIN_MATCH_CONFIDENCE = 0.5
-
-# Structural loophole fix: MIN_MATCH_CONFIDENCE is a *weighted average*, so a
-# near-perfect title match can single-handedly clear it even when the artist
-# is completely wrong. The combined score alone can't catch that — the artist
-# has to independently clear its own floor too. Starting conservative; tune
-# against real wrong-artist examples in failed_lookups if this over/under-fires.
-MIN_ARTIST_SCORE = 0.4
+# called "$ad Boy" — search can return the wrong one as its top hit, and a
+# fuzzy artist-similarity score can still be "close enough" for a different
+# person with a similar-looking name — "TOB Duke" vs "Madalen Duke", "Tom. G"
+# vs "Tom Peters"). Real mismatches slipped through fuzzy scoring undetected,
+# so artist matching is no longer fuzzy at all: a candidate is only accepted
+# if its MusicBrainz artist-credit is an EXACT match (case/whitespace-
+# normalized) for the artist name we searched with (Notion's Artist(s), or a
+# manual_overrides search_artist hint). No fuzzy fallback — if nothing
+# matches exactly, the album is flagged for manual review via failed_lookups
+# instead of silently attaching a possibly-wrong artist. See
+# _artist_exact_match() below.
+#
+# Title matching stays fuzzy (typos/edition differences in titles are common
+# and low-risk), gated by MIN_TITLE_CONFIDENCE — but only applied among
+# candidates that already passed the exact artist check.
+MIN_TITLE_CONFIDENCE = 0.5
 
 # Transient network hiccups (connection resets, timeouts, momentary 5xx from
 # MusicBrainz) surface as musicbrainzngs.WebServiceError, identically to a
@@ -76,6 +81,34 @@ def _candidate_artist_str(rg):
     )
 
 
+def _normalize_artist(name):
+    """Case/whitespace-insensitive normalization for exact-match comparison.
+    Deliberately NOT fuzzy — no stripping of punctuation, accents, or
+    near-miss spelling, since that's exactly the kind of "close enough"
+    leniency that let wrong-artist matches through before."""
+    return " ".join((name or "").strip().lower().split())
+
+
+def _artist_name_set(artist_str):
+    """Split a comma-joined artist string (both Notion's Artist(s) field and
+    MusicBrainz's artist-credit are joined this way) into a normalized set of
+    individual names, order-independent."""
+    return {_normalize_artist(part) for part in (artist_str or "").split(",") if part.strip()}
+
+
+def _artist_exact_match(candidate_artist_str, expected_artist_name):
+    """True only if the candidate's MusicBrainz artist-credit and the
+    expected artist (from Notion or a manual_overrides search_artist hint)
+    are the same set of names once normalized — handles solo artists and
+    multi-artist collabs alike, but requires an exact name match, not a
+    fuzzy one."""
+    expected_set = _artist_name_set(expected_artist_name)
+    candidate_set = _artist_name_set(candidate_artist_str)
+    if not expected_set or not candidate_set:
+        return False
+    return expected_set == candidate_set
+
+
 def get_artist_tags(artist_mbid):
     """Fetch an artist's own MusicBrainz tag-list, sorted by community votes.
     Used as a fallback when a specific release-group has few/no tags of its own."""
@@ -100,12 +133,11 @@ def get_metadata(album_name, artist_name):
     try:
         # 1. Search for the Release Group
         # Searching by Release Group is better for catching the "master" record.
-        # Fetch several candidates rather than trusting MusicBrainz's #1 result
-        # blindly — its search ranking sometimes favors an exact title match
-        # over the correct artist, which can silently attach the wrong
-        # album's metadata (e.g. two different artists both have a release
-        # called "$ad Boy" — the wrong one can rank first).
-        search = _mb_call(musicbrainzngs.search_release_groups, artist=artist_name, releasegroup=album_name, limit=5)
+        # Fetch more candidates than before (10, was 5) — now that acceptance
+        # requires an EXACT artist match rather than a fuzzy score, the right
+        # candidate needs to actually be in the fetched set, so it's worth
+        # casting a slightly wider net against MusicBrainz's own ranking.
+        search = _mb_call(musicbrainzngs.search_release_groups, artist=artist_name, releasegroup=album_name, limit=10)
 
         candidates = search.get('release-group-list', [])
         if not candidates:
@@ -114,29 +146,39 @@ def get_metadata(album_name, artist_name):
         scored = []
         for rg in candidates:
             title_score = _similarity(rg.get('title'), album_name)
-            artist_score = _similarity(_candidate_artist_str(rg), artist_name)
-            combined_score = title_score * 0.5 + artist_score * 0.5
-            scored.append((combined_score, artist_score, rg))
-        scored.sort(key=lambda tup: tup[0], reverse=True)
-        best_score, best_artist_score, best_rg = scored[0]
+            candidate_artist_str = _candidate_artist_str(rg)
+            exact_match = _artist_exact_match(candidate_artist_str, artist_name)
+            scored.append((title_score, exact_match, candidate_artist_str, rg))
 
-        if best_score < MIN_MATCH_CONFIDENCE:
+        # Artist matching is exact-only now (see comment on MIN_TITLE_CONFIDENCE
+        # above) — a fuzzy-close artist name is treated the same as a totally
+        # wrong one: not a match. No candidate with an exact artist match means
+        # we don't know which act this actually is, so flag it for manual
+        # review (via failed_lookups) rather than guess.
+        exact_candidates = [c for c in scored if c[1]]
+        if not exact_candidates:
+            candidate_summary = "; ".join(
+                f"'{c[3].get('title')}' by {c[2]}" for c in scored[:5]
+            ) or "none"
             reason = (
-                f"No confident MusicBrainz match (best candidate: '{best_rg.get('title')}' "
-                f"by {_candidate_artist_str(best_rg)}, score {best_score:.2f} < {MIN_MATCH_CONFIDENCE}) "
-                f"— check for a typo in the title/artist, or the release may need a manual MBID override"
+                f"No MusicBrainz candidate had an exact artist match for '{artist_name}' "
+                f"(case/whitespace-normalized) — top candidates found: {candidate_summary}. "
+                f"Flagged for manual review: confirm the correct artist and add a "
+                f"manual_overrides search_artist hint, or fix the source artist name if "
+                f"MusicBrainz spells/lists it differently."
             )
             print(f"{reason} [{album_name} by {artist_name}]")
             return None, reason
 
-        # See MIN_ARTIST_SCORE above: a strong title match can't compensate for
-        # a weak artist match. Catches the case a bare combined-score check misses.
-        if best_artist_score < MIN_ARTIST_SCORE:
+        exact_candidates.sort(key=lambda tup: tup[0], reverse=True)
+        best_title_score, _, best_candidate_artist_str, best_rg = exact_candidates[0]
+
+        if best_title_score < MIN_TITLE_CONFIDENCE:
             reason = (
-                f"No confident MusicBrainz match (best candidate: '{best_rg.get('title')}' "
-                f"by {_candidate_artist_str(best_rg)}, artist score {best_artist_score:.2f} < {MIN_ARTIST_SCORE}, "
-                f"combined score {best_score:.2f}) — title matched well but the artist didn't; "
-                f"likely a different artist's same-titled release, or needs a manual MBID override"
+                f"Artist matched exactly ({best_candidate_artist_str}) but no candidate title "
+                f"was a confident match for '{album_name}' (best: '{best_rg.get('title')}', "
+                f"score {best_title_score:.2f} < {MIN_TITLE_CONFIDENCE}) — check for a typo in "
+                f"the title, or the release may need a manual MBID override"
             )
             print(f"{reason} [{album_name} by {artist_name}]")
             return None, reason

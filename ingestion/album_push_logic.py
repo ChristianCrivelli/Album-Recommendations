@@ -25,13 +25,16 @@ FULL_SYNC = os.getenv("FULL_SYNC", "false").strip().lower() == "true"
 
 
 def get_existing_album_ids() -> dict:
-    """Maps lower-cased title -> primary key id for every album already in
+    """Maps lower-cased title -> {id, title} for every album already in
     Supabase. Used to batch the nightly rating/timestamp refresh via a single
     upsert keyed on id (the primary key, so no new unique constraint is
-    needed) instead of one UPDATE ... WHERE title = ... round-trip per row."""
+    needed) instead of one UPDATE ... WHERE title = ... round-trip per row.
+    The DB's own title is carried along so the refresh upsert can round-trip
+    it back untouched — see the comment on refresh_records below for why
+    that's necessary even though this refresh never intends to change title."""
     resp = supabase.table("albums").select("id, title").execute()
     return {
-        row["title"].strip().lower(): row["id"]
+        row["title"].strip().lower(): {"id": row["id"], "title": row["title"]}
         for row in resp.data
         if row.get("title") and row.get("id")
     }
@@ -100,9 +103,21 @@ else:
     # upsert keyed on id (the primary key, so it works without a new unique
     # constraint on title) instead, chunked at 500 rows/request to stay
     # under any request payload limit.
+    #
+    # NOTE: even though every row here is really just an update to an
+    # existing id, Postgres/PostgREST still validate NOT NULL constraints
+    # (like albums.title) on the row as constructed for the INSERT branch of
+    # "INSERT ... ON CONFLICT DO UPDATE" *before* the conflict is resolved —
+    # so leaving a NOT NULL column out of the payload blows up the whole
+    # batch, even though the update itself never touches that column. This
+    # crashed every run on 2026-08-19 (see issue #11) because "title" wasn't
+    # included here. Round-tripping the album's own current title back
+    # through the payload satisfies that check without actually changing
+    # anything — title is intentionally left untouched by this refresh.
     refresh_records = [
         {
-            "id": existing_album_ids[row.Title.strip().lower()],
+            "id": existing_album_ids[row.Title.strip().lower()]["id"],
+            "title": existing_album_ids[row.Title.strip().lower()]["title"],
             "rating": row.Rating,
             "notion_created_at": row.NotionCreatedAt,
             "notion_edited_at": row.NotionEditedAt,
@@ -110,12 +125,25 @@ else:
         for row in df[~is_new].itertuples()
     ]
 
+    refresh_failures = 0
     for chunk in _chunked(refresh_records, 500):
-        supabase.table("albums").upsert(chunk, on_conflict="id").execute()
+        try:
+            supabase.table("albums").upsert(chunk, on_conflict="id").execute()
+        except Exception as e:
+            # A bad batch here used to take the entire run down before it
+            # ever reached a single album's enrichment (the 2026-08-19
+            # outage: the whole night's ingestion — every new album — was
+            # skipped because this upsert crashed in the first 35 seconds).
+            # Log it and keep going instead: a failed rating/timestamp
+            # refresh for some already-synced albums is far cheaper than
+            # losing an entire night's worth of new-album ingestion.
+            refresh_failures += 1
+            print(f"Warning: rating/timestamp refresh batch failed ({len(chunk)} album(s)): {e}")
 
     skipped = len(refresh_records)
     df = df[is_new]
-    print(f"Delta pull: {len(df)} new album(s) to enrich, {skipped} already synced (rating refreshed in {max(1, -(-skipped // 500)) if skipped else 0} batch(es)).")
+    refresh_note = f", {refresh_failures} refresh batch(es) failed — see warnings above" if refresh_failures else ""
+    print(f"Delta pull: {len(df)} new album(s) to enrich, {skipped} already synced (rating refreshed in {max(1, -(-skipped // 500)) if skipped else 0} batch(es){refresh_note}).")
 
 # Tip 3: track failures so we can save them at the end
 failures = []
