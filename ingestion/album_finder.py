@@ -1,6 +1,5 @@
 import os
 import time
-import difflib
 import musicbrainzngs
 from dotenv import load_dotenv
  
@@ -36,10 +35,18 @@ TAG_FALLBACK_THRESHOLD = 3
 # instead of silently attaching a possibly-wrong artist. See
 # _artist_exact_match() below.
 #
-# Title matching stays fuzzy (typos/edition differences in titles are common
-# and low-risk), gated by MIN_TITLE_CONFIDENCE — but only applied among
-# candidates that already passed the exact artist check.
-MIN_TITLE_CONFIDENCE = 0.5
+# Title matching used to be fuzzy (difflib.SequenceMatcher, gated by a
+# MIN_TITLE_CONFIDENCE score threshold) on the theory that typos/edition
+# differences are common and low-risk. In practice this let wrong-album
+# matches through the same way fuzzy artist matching let wrong-artist matches
+# through — a fuzzy-close title on an EP, live album, or deluxe reissue could
+# out-rank the actual release. Title matching is now exact-only too, mirroring
+# artist matching exactly: a candidate is only accepted if its MusicBrainz
+# release-group title is an EXACT match (case/whitespace-normalized) for the
+# title we searched with. See _title_exact_match() below. No fuzzy fallback —
+# if MusicBrainz has no release by that exact artist with that exact title,
+# the album is flagged for manual review via failed_lookups instead of
+# guessing at the closest-sounding candidate.
 
 # Transient network hiccups (connection resets, timeouts, momentary 5xx from
 # MusicBrainz) surface as musicbrainzngs.WebServiceError, identically to a
@@ -68,10 +75,6 @@ def _mb_call(fn, *args, **kwargs):
                 print(f"MusicBrainz call failed (attempt {attempt}/{MB_MAX_ATTEMPTS}): {exc} — retrying...")
                 time.sleep(MB_RETRY_BACKOFF * attempt)
     raise last_exc
-
-
-def _similarity(a, b):
-    return difflib.SequenceMatcher(None, (a or "").lower().strip(), (b or "").lower().strip()).ratio()
 
 
 def _candidate_artist_str(rg):
@@ -109,6 +112,25 @@ def _artist_exact_match(candidate_artist_str, expected_artist_name):
     return expected_set == candidate_set
 
 
+def _normalize_title(title):
+    """Case/whitespace-insensitive normalization for exact-match comparison.
+    Mirrors _normalize_artist above — deliberately NOT fuzzy, and does not
+    strip punctuation/edition markers ("(Deluxe)", "(Live)", etc.), since a
+    deluxe/live/remix edition being distinct from the original album is
+    exactly the kind of "close enough" leniency that let wrong matches
+    through before."""
+    return " ".join((title or "").strip().lower().split())
+
+
+def _title_exact_match(candidate_title, expected_title):
+    """True only if the candidate's MusicBrainz release-group title is an
+    EXACT match (case/whitespace-normalized) for the title we searched with
+    (Notion's Title, or a manual_overrides search_title hint)."""
+    a = _normalize_title(candidate_title)
+    b = _normalize_title(expected_title)
+    return bool(a) and bool(b) and a == b
+
+
 def get_artist_tags(artist_mbid):
     """Fetch an artist's own MusicBrainz tag-list, sorted by community votes.
     Used as a fallback when a specific release-group has few/no tags of its own."""
@@ -134,9 +156,10 @@ def get_metadata(album_name, artist_name):
         # 1. Search for the Release Group
         # Searching by Release Group is better for catching the "master" record.
         # Fetch more candidates than before (10, was 5) — now that acceptance
-        # requires an EXACT artist match rather than a fuzzy score, the right
-        # candidate needs to actually be in the fetched set, so it's worth
-        # casting a slightly wider net against MusicBrainz's own ranking.
+        # requires an EXACT title AND EXACT artist match rather than fuzzy
+        # scoring, the right candidate needs to actually be in the fetched
+        # set, so it's worth casting a slightly wider net against
+        # MusicBrainz's own ranking.
         search = _mb_call(musicbrainzngs.search_release_groups, artist=artist_name, releasegroup=album_name, limit=10)
 
         candidates = search.get('release-group-list', [])
@@ -145,43 +168,38 @@ def get_metadata(album_name, artist_name):
 
         scored = []
         for rg in candidates:
-            title_score = _similarity(rg.get('title'), album_name)
+            title_exact = _title_exact_match(rg.get('title'), album_name)
             candidate_artist_str = _candidate_artist_str(rg)
-            exact_match = _artist_exact_match(candidate_artist_str, artist_name)
-            scored.append((title_score, exact_match, candidate_artist_str, rg))
+            artist_exact = _artist_exact_match(candidate_artist_str, artist_name)
+            scored.append((title_exact, artist_exact, candidate_artist_str, rg))
 
-        # Artist matching is exact-only now (see comment on MIN_TITLE_CONFIDENCE
-        # above) — a fuzzy-close artist name is treated the same as a totally
-        # wrong one: not a match. No candidate with an exact artist match means
-        # we don't know which act this actually is, so flag it for manual
-        # review (via failed_lookups) rather than guess.
-        exact_candidates = [c for c in scored if c[1]]
+        # Both title and artist matching are exact-only now (see comment on
+        # this file's title-matching note above) — a fuzzy-close title or
+        # artist name is treated the same as a totally wrong one: not a
+        # match. No candidate with BOTH an exact title match and an exact
+        # artist match means we don't know which release this actually is,
+        # so flag it for manual review (via failed_lookups) rather than
+        # guess at the closest-sounding candidate.
+        exact_candidates = [c for c in scored if c[0] and c[1]]
         if not exact_candidates:
             candidate_summary = "; ".join(
                 f"'{c[3].get('title')}' by {c[2]}" for c in scored[:5]
             ) or "none"
             reason = (
-                f"No MusicBrainz candidate had an exact artist match for '{artist_name}' "
-                f"(case/whitespace-normalized) — top candidates found: {candidate_summary}. "
-                f"Flagged for manual review: confirm the correct artist and add a "
-                f"manual_overrides search_artist hint, or fix the source artist name if "
-                f"MusicBrainz spells/lists it differently."
+                f"No MusicBrainz candidate had both an exact title match for '{album_name}' "
+                f"and an exact artist match for '{artist_name}' (case/whitespace-normalized) — "
+                f"top candidates found: {candidate_summary}. Flagged for manual review: confirm "
+                f"the correct title/artist and add a manual_overrides search_title/search_artist "
+                f"hint, or fix the source data if MusicBrainz spells/lists it differently."
             )
             print(f"{reason} [{album_name} by {artist_name}]")
             return None, reason
 
-        exact_candidates.sort(key=lambda tup: tup[0], reverse=True)
-        best_title_score, _, best_candidate_artist_str, best_rg = exact_candidates[0]
-
-        if best_title_score < MIN_TITLE_CONFIDENCE:
-            reason = (
-                f"Artist matched exactly ({best_candidate_artist_str}) but no candidate title "
-                f"was a confident match for '{album_name}' (best: '{best_rg.get('title')}', "
-                f"score {best_title_score:.2f} < {MIN_TITLE_CONFIDENCE}) — check for a typo in "
-                f"the title, or the release may need a manual MBID override"
-            )
-            print(f"{reason} [{album_name} by {artist_name}]")
-            return None, reason
+        # More than one exact match is possible (e.g. the same album
+        # reissued under separate release-groups). MusicBrainz's own search
+        # ranking is already relevance-ordered, so just take its first hit
+        # among the exact matches rather than introducing a new scoring rule.
+        _, _, best_candidate_artist_str, best_rg = exact_candidates[0]
 
         rg_id = best_rg['id']
         
@@ -235,13 +253,22 @@ def get_metadata(album_name, artist_name):
         artist_mbids = []
         artist_dicts = []  # Tip 2: initialise here so it always exists
         release_id = None  # Tip 2: initialise here so it always exists
+        producers = []  # initialise here so it always exists, same reasoning
  
         # We need a specific release to get tracks and labels. We'll just grab the first one.
         if 'release-list' in rg_data and len(rg_data['release-list']) > 0:
             release_id = rg_data['release-list'][0]['id']
             
-            # Fetch the specific release including tracks, labels, and artist credits
-            release_data = _mb_call(musicbrainzngs.get_release_by_id, release_id, includes=["recordings", "labels", "artist-credits"])['release']
+            # Fetch the specific release including tracks, labels, artist
+            # credits, AND artist relationships (producer credits) in one
+            # call. This used to be two separate get_release_by_id calls for
+            # the exact same release_id — this one, and a second one made
+            # later by get_producers(release_id) with includes=["artist-rels"]
+            # only. Same endpoint, same release, just different includes —
+            # merged here to save a full MB_SLEEP round-trip per album (see
+            # the perf discussion in issue #13). Producers are extracted
+            # below, right after this fetch, from the same response.
+            release_data = _mb_call(musicbrainzngs.get_release_by_id, release_id, includes=["recordings", "labels", "artist-credits", "artist-rels"])['release']
             
             # Extract Labels
             if 'label-info-list' in release_data:
@@ -263,7 +290,7 @@ def get_metadata(album_name, artist_name):
             if track_count > 0:
                 avg_ms = total_ms / track_count
                 avg_track_length = round(avg_ms / 60000, 2) # Convert to minutes
- 
+
             # Tip 2: build artist_dicts inside the block where release_data is guaranteed to exist
             if 'artist-credit' in release_data:
                 for c in release_data['artist-credit']:
@@ -271,6 +298,18 @@ def get_metadata(album_name, artist_name):
                         artist_dicts.append({
                             'name': c['artist']['name'],
                             'mbid': c['artist']['id']
+                        })
+
+            # Extract producer credits from the same release_data fetched
+            # above (now includes "artist-rels") instead of a second
+            # get_release_by_id call — see the comment on that fetch.
+            if 'artist-relation-list' in release_data:
+                for rel in release_data['artist-relation-list']:
+                    if rel['type'] == 'producer':
+                        artist_info = rel['artist']
+                        producers.append({
+                            'name': artist_info['name'],
+                            'mbid': artist_info['id']
                         })
 
         # Fallback: the specific release sometimes has no artist-credit data
@@ -309,8 +348,8 @@ def get_metadata(album_name, artist_name):
             # pressing MusicBrainz happens to return first. This is what
             # should be persisted as the durable identifier (see
             # album_push_logic.py). Release ID (below) is still needed for
-            # this run's track/label lookups and get_producers(), but is
-            # NOT safe to treat as a stable per-album key — MusicBrainz
+            # this run's track/label lookups, but is NOT safe to treat as a
+            # stable per-album key — MusicBrainz
             # doesn't guarantee release-list ordering is the same between
             # calls, so re-processing the same album (e.g. the monthly
             # FULL_SYNC deep sync) could previously land on a different
@@ -318,7 +357,8 @@ def get_metadata(album_name, artist_name):
             # the same album to be inserted as a brand new row every run.
             "Release Group ID": rg_id,
             "Release ID": release_id,
-            "Artists": artist_dicts  
+            "Artists": artist_dicts,
+            "Producers": producers,
         }, None
         
     except musicbrainzngs.WebServiceError as exc:
@@ -332,6 +372,14 @@ def get_metadata(album_name, artist_name):
         return None, reason
 
 def get_producers(release_id):
+    """Standalone producer lookup for a known release_id.
+
+    NOT called by the main pipeline anymore (album_push_logic.py) — that
+    path gets producers for free from get_metadata()'s own release_data
+    fetch, which now includes "artist-rels" too, instead of making this
+    exact same MusicBrainz call a second time. Kept here for standalone/
+    one-off use (e.g. scripts operating on a release_id without having
+    called get_metadata first)."""
     result = _mb_call(musicbrainzngs.get_release_by_id, release_id, includes=["artist-rels"])
 
     producers = []

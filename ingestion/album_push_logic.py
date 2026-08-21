@@ -6,7 +6,7 @@ from supabase import create_client, Client
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ingestion.pull_albums import fetch_notion_dataframe
-from ingestion.album_finder import get_metadata, get_producers
+from ingestion.album_finder import get_metadata
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 from ingestion.manual_overrides import get_override
@@ -22,6 +22,12 @@ supabase: Client = create_client(url, key)
 # FULL_SYNC=true forces a ground-up rebuild (used by the monthly deep sync).
 # Otherwise this is a delta pull: only new albums hit MusicBrainz/Spotify.
 FULL_SYNC = os.getenv("FULL_SYNC", "false").strip().lower() == "true"
+
+# Optional sharding — see the comment where these are applied to `df` below
+# for why this exists (issue #13: FULL_SYNC runs weren't finishing within
+# GitHub Actions' 6h job cap).
+SHARD_COUNT = int(os.getenv("SHARD_COUNT", "1") or "1")
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0") or "0")
 
 
 def get_existing_album_ids() -> dict:
@@ -145,6 +151,27 @@ else:
     refresh_note = f", {refresh_failures} refresh batch(es) failed — see warnings above" if refresh_failures else ""
     print(f"Delta pull: {len(df)} new album(s) to enrich, {skipped} already synced (rating refreshed in {max(1, -(-skipped // 500)) if skipped else 0} batch(es){refresh_note}).")
 
+# === Optional sharding: split this run's enrichment across parallel jobs ===
+# A FULL_SYNC re-enriches every album against MusicBrainz — 3+ calls per
+# album at ~1.1s each — which has consistently taken 4-6+ hours against
+# GitHub Actions' hard 6h per-job cap, and the 2026-08-21 run got killed by
+# it before finishing (issue #13). Rather than build real cross-run
+# resumability, deep_sync.yml can run several shards of this same job in
+# parallel (a build matrix): each shard gets a disjoint slice of the album
+# list via SHARD_INDEX/SHARD_COUNT, so wall-clock time drops roughly in
+# proportion to the shard count. Different GitHub-hosted runners get
+# different IPs, so MusicBrainz's 1 req/sec-per-IP limit is respected
+# independently by each shard without any cross-shard coordination needed.
+# Sorting by title before slicing keeps a given shard's assignment stable
+# from run to run even if Notion's row order changes. No-op when
+# SHARD_COUNT=1 (the default — every other caller of this script).
+if SHARD_COUNT > 1:
+    if not (0 <= SHARD_INDEX < SHARD_COUNT):
+        raise ValueError(f"SHARD_INDEX ({SHARD_INDEX}) must be in [0, {SHARD_COUNT})")
+    df = df.sort_values("Title", kind="stable").reset_index(drop=True)
+    df = df.iloc[SHARD_INDEX::SHARD_COUNT]
+    print(f"Shard {SHARD_INDEX}/{SHARD_COUNT}: {len(df)} album(s) assigned to this job.")
+
 # Tip 3: track failures so we can save them at the end
 failures = []
 
@@ -194,7 +221,13 @@ for row in df.itertuples():
             }
 
             # Entities B & C (Contributors)
-            producers = get_producers(release_id)
+            # get_metadata() now pulls producer credits from the same
+            # release fetch it already makes for tracks/labels (its
+            # release_data includes "artist-rels" too) instead of this
+            # code making a second, separate get_release_by_id call for the
+            # exact same release_id — see the comment on that fetch in
+            # album_finder.py and issue #13.
+            producers = meta.get('Producers', [])
             contributors = []
 
             for artist in meta.get('Artists', []):
