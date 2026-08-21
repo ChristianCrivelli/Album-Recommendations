@@ -10,6 +10,22 @@ jobs:
   deep-sync:
     runs-on: ubuntu-latest
 
+    # Run 4 shards of the same full rebuild in parallel instead of one long
+    # serial pass. A FULL_SYNC re-enriches every album against MusicBrainz
+    # (3+ calls/album at ~1.1s each) which had consistently been taking
+    # 4-6+ hours -- right up against, and on 2026-08-21 past, GitHub
+    # Actions' hard 6h per-job cap (see issue #13). Each shard here gets a
+    # disjoint 1/4 slice of the album list (via SHARD_INDEX/SHARD_COUNT,
+    # applied in ingestion/album_push_logic.py) and runs on its own
+    # GitHub-hosted runner with its own IP, so MusicBrainz's 1 req/sec-per-IP
+    # limit is respected independently by each shard with no coordination
+    # needed between them. fail-fast: false so one shard's failure doesn't
+    # cancel the other three's progress.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+
     steps:
     # 1. Check out your code from GitHub onto the cloud runner
     - name: Check out repository code
@@ -28,9 +44,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    # 4. Execute the pipeline with a forced full rebuild
+    # 4. Execute this shard's slice of the forced full rebuild
     # We pass the GitHub secrets into the runner's environment variables
-    - name: Run Python script (full rebuild)
+    - name: Run Python script (full rebuild, shard ${{ matrix.shard }}/4)
       env:
         notion_key: ${{ secrets.NOTION_KEY }}
         database_id: ${{ secrets.DATABASE_ID }}
@@ -40,5 +56,7 @@ jobs:
         supabase_url: ${{ secrets.SUPABASE_URL }}
         supabase_key: ${{ secrets.SUPABASE_KEY }}
         FULL_SYNC: "true"
+        SHARD_INDEX: ${{ matrix.shard }}
+        SHARD_COUNT: "4"
       run: |
         python -m ingestion.album_push_logic
