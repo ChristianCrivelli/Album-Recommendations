@@ -84,12 +84,36 @@ def _candidate_artist_str(rg):
     )
 
 
+# A small number of well-known artists are indexed on MusicBrainz under a
+# different name than the one Notion (and most people) actually use — not a
+# misspelling, a real rename/rebrand (Kanye West's MusicBrainz artist-credit
+# is "Ye"). Under strict exact-matching (see comment above), a search for
+# "Kanye West" can never match a candidate credited to "Ye", so every new
+# Kanye West album added to Notion would otherwise need its own one-off
+# manual_overrides row just to work around the same rename every time.
+# Resolving both sides of the comparison through this table fixes it once,
+# for every current and future album by this artist, without touching
+# Notion's more familiar spelling or MusicBrainz's own data. Deliberately
+# small and manually curated — add an entry here only once a real
+# rename/rebrand has actually produced a failed_lookups row, not
+# preemptively for every stylization difference (most of those — Tyler The
+# Creator, PinkPantheress, etc. — are one-off enough to leave as the
+# "benign difference" the wrong-artist audit already treats them as).
+ARTIST_ALIASES = {
+    "kanye west": "ye",
+}
+
+
 def _normalize_artist(name):
     """Case/whitespace-insensitive normalization for exact-match comparison.
     Deliberately NOT fuzzy — no stripping of punctuation, accents, or
     near-miss spelling, since that's exactly the kind of "close enough"
-    leniency that let wrong-artist matches through before."""
-    return " ".join((name or "").strip().lower().split())
+    leniency that let wrong-artist matches through before. The one
+    exception is ARTIST_ALIASES above, applied after normalization so it
+    matches regardless of which side (search input or MB candidate) the
+    alias name appears on."""
+    normalized = " ".join((name or "").strip().lower().split())
+    return ARTIST_ALIASES.get(normalized, normalized)
 
 
 def _artist_name_set(artist_str):

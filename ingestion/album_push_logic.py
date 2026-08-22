@@ -37,11 +37,37 @@ def get_existing_album_ids() -> dict:
     needed) instead of one UPDATE ... WHERE title = ... round-trip per row.
     The DB's own title is carried along so the refresh upsert can round-trip
     it back untouched — see the comment on refresh_records below for why
-    that's necessary even though this refresh never intends to change title."""
-    resp = supabase.table("albums").select("id, title").execute()
+    that's necessary even though this refresh never intends to change title.
+
+    PAGINATED: PostgREST (Supabase's REST layer) silently caps a single
+    .select() at 1000 rows — no error, no truncation flag, it just stops.
+    This table crossed 1000 rows at some point after this function was
+    first written, and every run since then was quietly missing the tail
+    end of it. Whichever albums fell outside the first 1000 looked "new" to
+    the is_new check below, got needlessly re-sent through get_metadata()
+    every single night (wasted MusicBrainz calls, longer runtime), and —
+    now that matching is exact-only (see album_finder.py) — sometimes
+    failed to re-match under the stricter rules and landed in
+    failed_lookups looking like a real data problem, even though the
+    existing row was already correct (2026-08-22: this is what "Section
+    80", "Who Cares", "Sugar Papi", "After da Boat", and a few others
+    turned out to be — not bad Notion data, just this function forgetting
+    they existed). Paginating in PAGE_SIZE chunks via .range() — the same
+    fix pull_albums.py already applies to the Notion side — makes sure
+    every row is actually seen, however many there now are."""
+    PAGE_SIZE = 1000
+    all_rows = []
+    start = 0
+    while True:
+        resp = supabase.table("albums").select("id, title").range(start, start + PAGE_SIZE - 1).execute()
+        batch = resp.data or []
+        all_rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+        start += PAGE_SIZE
     return {
         row["title"].strip().lower(): {"id": row["id"], "title": row["title"]}
-        for row in resp.data
+        for row in all_rows
         if row.get("title") and row.get("id")
     }
 
