@@ -1,5 +1,7 @@
 # Album Recommendations
 
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 A personal album-recommendation pipeline. It pulls my own rated album
 library out of Notion, enriches each album with real metadata and tags from
 MusicBrainz, stores everything in Supabase, and computes content-based

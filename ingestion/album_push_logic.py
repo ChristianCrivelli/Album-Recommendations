@@ -65,6 +65,19 @@ def get_existing_album_ids() -> dict:
         if len(batch) < PAGE_SIZE:
             break
         start += PAGE_SIZE
+    # NOTE (issue #14): this dict is keyed by lower-cased title, which
+    # assumed titles were unique — true when this was written, no longer
+    # guaranteed now that albums.title's UNIQUE constraint has been dropped
+    # (two different real albums can share a title). If that ever actually
+    # happens, whichever row comes last in `all_rows` silently wins the dict
+    # slot and the other same-titled album would incorrectly be treated as
+    # "already synced" by the is_new check below, or have its rating refresh
+    # applied to the wrong id. Not fixed here — there are zero title
+    # collisions in the data as of 2026-08-25, and properly disambiguating
+    # would mean joining album_contributions per title here too, which is
+    # more than this function's job (fast existence/refresh lookup) should
+    # take on speculatively. Worth a look if a real collision ever shows up
+    # in failed_lookups or a bad rating-refresh.
     return {
         row["title"].strip().lower(): {"id": row["id"], "title": row["title"]}
         for row in all_rows
@@ -209,12 +222,17 @@ for row in df.itertuples():
     search_artist = ""  # available in the except block below even if we fail before it's set
 
     try:
-        # 0. Check for a manual override before touching MusicBrainz at all —
-        # see database_info/migrations/manual_overrides.sql for the two modes.
-        override = get_override(supabase, row.Title)
-
         # 1. Get metadata
         search_artist = ", ".join(row.Artists)
+
+        # 0. Check for a manual override before touching MusicBrainz at all —
+        # see database_info/manual_override_examples.sql for the two modes.
+        # Computed above search_artist's normal spot because get_override()
+        # now needs it: title alone can no longer be trusted as a unique
+        # lookup key (issue #14 — two different real albums can share an
+        # exact title), so it's passed through to disambiguate the rare case
+        # where more than one override row shares this title.
+        override = get_override(supabase, row.Title, search_artist)
 
         if override and override.get("skip_musicbrainz"):
             # Full-manual mode: never call MusicBrainz for this title.
@@ -279,9 +297,16 @@ for row in df.itertuples():
             # (a) survives repeated runs without spawning duplicate rows,
             # and (b) correctly keeps two different artists' same-titled
             # albums as separate rows, since their release-group ids
-            # differ. Keying on title instead would break that second
-            # case — two real different albums sharing a name would
-            # collide into one row.
+            # differ. This used to fail on (b) — and on any upsert where
+            # MusicBrainz's search landed on a different-but-still-valid
+            # mbid for an existing title — because albums.title also had
+            # its own UNIQUE constraint, so a new mbid with an already-used
+            # title tripped that instead of just inserting cleanly (issue
+            # #14, the FULL_SYNC crash from 2026-08-21). That constraint has
+            # been dropped — see database_info/queries/
+            # title_uniqueness_migration.sql — so mbid is now the only
+            # uniqueness this upsert has to satisfy, which is what should
+            # define "one album" here in the first place.
             album_resp = supabase.table("albums").upsert(
                 album_data,
                 on_conflict="mbid"
@@ -421,14 +446,52 @@ for row in df.itertuples():
                 "notion_edited_at": row.NotionEditedAt,
             }
 
+            # manual_artist_names is needed before the lookup below now (see
+            # that comment), not just for the contributors loop further down.
+            manual_artist_names = override.get("manual_artist_names") or row.Artists
+
             # A NULL mbid never "conflicts" with anything under Postgres
             # uniqueness rules, so on_conflict="mbid" would insert a fresh
             # duplicate album row on every single re-run. Find-or-update by
-            # title instead — title is already this pipeline's de facto
-            # unique key for any album without an mbid.
-            existing_album = supabase.table("albums").select("id").eq("title", row.Title).limit(1).execute()
-            if existing_album.data:
-                album_db_id = existing_album.data[0]['id']
+            # title instead. Title alone used to be this pipeline's de facto
+            # unique key for any album without an mbid, but the
+            # albums.title unique constraint is gone now (issue #14 — two
+            # different real albums can share an exact title), so more than
+            # one row can come back here. Disambiguate by the manually-
+            # overridden artist(s) when that happens; fall back to the first
+            # row (old behavior) if nothing matches rather than dropping the
+            # album.
+            existing_rows = (supabase.table("albums").select("id").eq("title", row.Title).execute().data or [])
+            album_db_id = None
+            if len(existing_rows) == 1:
+                album_db_id = existing_rows[0]['id']
+            elif len(existing_rows) > 1:
+                wanted_names = {n.strip().lower() for n in manual_artist_names}
+                for candidate in existing_rows:
+                    linked = (
+                        supabase.table("album_contributions")
+                        .select("artists(name)")
+                        .eq("album_id", candidate['id'])
+                        .eq("role", "artist")
+                        .execute()
+                    )
+                    linked_names = {
+                        c["artists"]["name"].strip().lower()
+                        for c in (linked.data or [])
+                        if c.get("artists") and c["artists"].get("name")
+                    }
+                    if linked_names & wanted_names:
+                        album_db_id = candidate['id']
+                        break
+                if album_db_id is None:
+                    print(
+                        f"Warning: {len(existing_rows)} existing albums share title "
+                        f"'{row.Title}' and none matched artist(s) {sorted(wanted_names)} — "
+                        f"using the first row."
+                    )
+                    album_db_id = existing_rows[0]['id']
+
+            if album_db_id:
                 supabase.table("albums").update(album_data).eq("id", album_db_id).execute()
             else:
                 created_album = supabase.table("albums").insert(album_data).execute()
@@ -446,7 +509,6 @@ for row in df.itertuples():
             # definition. Wipe old artist links first so re-running replaces
             # rather than accumulates duplicates if manual_artist_names changes.
             supabase.table("album_contributions").delete().eq("album_id", album_db_id).eq("role", "artist").execute()
-            manual_artist_names = override.get("manual_artist_names") or row.Artists
             for name in manual_artist_names:
                 existing_artist = supabase.table("artists").select("id").eq("name", name).limit(1).execute()
                 if existing_artist.data:

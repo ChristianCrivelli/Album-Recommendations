@@ -20,6 +20,10 @@ CREATE TABLE public.album_tags (
 );
 CREATE TABLE public.albums (
   id uuid NOT NULL DEFAULT uuid_generate_v4(),
+  -- title is intentionally NOT unique (issue #14) — two different real
+  -- albums by different artists can legitimately share an exact title.
+  -- mbid (below) is the real identity key for MusicBrainz-backed rows.
+  -- See database_info/queries/title_uniqueness_migration.sql.
   title text NOT NULL,
   mbid text UNIQUE,
   rating numeric,
@@ -43,7 +47,14 @@ CREATE TABLE public.tags (
   CONSTRAINT tags_pkey PRIMARY KEY (id)
 );
 CREATE TABLE public.manual_overrides (
+  -- Re-keyed on a surrogate id (issue #14) — title alone stopped being a
+  -- safe primary key once two different real albums were confirmed to
+  -- share a title. `artist` disambiguates the rare case where more than
+  -- one override shares a title; NULL for every row today. See
+  -- database_info/queries/title_uniqueness_migration.sql.
+  id uuid NOT NULL DEFAULT uuid_generate_v4(),
   title text NOT NULL,
+  artist text,
   search_title text,
   search_artist text,
   skip_musicbrainz boolean NOT NULL DEFAULT false,
@@ -54,5 +65,9 @@ CREATE TABLE public.manual_overrides (
   manual_artist_names text[],
   notes text,
   created_at timestamp with time zone NOT NULL DEFAULT timezone('utc'::text, now()),
-  CONSTRAINT manual_overrides_pkey PRIMARY KEY (title)
+  CONSTRAINT manual_overrides_pkey PRIMARY KEY (id)
 );
+-- Plus an expression unique index (can't be expressed as a table CONSTRAINT
+-- since it involves COALESCE) — see title_uniqueness_migration.sql:
+-- CREATE UNIQUE INDEX manual_overrides_title_artist_key
+--   ON public.manual_overrides (title, COALESCE(artist, ''));

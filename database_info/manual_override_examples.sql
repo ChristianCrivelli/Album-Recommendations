@@ -1,6 +1,14 @@
--- Example rows for database_info/migrations/manual_overrides.sql, covering
--- the failed_lookups.csv entries diagnosed in this conversation. Edit
--- values before running — these are starting points, not verified facts.
+-- Example rows for database_info/queries/manual_overrides_migration.sql,
+-- covering the failed_lookups.csv entries diagnosed in this conversation.
+-- Edit values before running — these are starting points, not verified
+-- facts.
+--
+-- NOTE: after database_info/queries/title_uniqueness_migration.sql (issue
+-- #14) is applied, manual_overrides has an extra nullable `artist` column
+-- and its primary key is a surrogate `id`, not `title`. The ON CONFLICT
+-- targets below were updated to match; leave `artist` NULL unless you're
+-- deliberately adding a second override for a title that collides with an
+-- existing one.
 
 -- SEARCH-HINT example: "1 Doulbe 0" is a typo in Notion for "1 Double 0"
 -- (That Mexican OT, 2021 mixtape) — MusicBrainz has the real thing, the
@@ -15,7 +23,13 @@ VALUES (
   'That Mexican OT',
   'Typo in Notion title — should be "1 Double 0". Fix Notion when convenient.'
 )
-ON CONFLICT (title) DO UPDATE SET
+-- Conflict target matches the (title, COALESCE(artist, '')) unique index
+-- from title_uniqueness_migration.sql (issue #14) — a plain ON CONFLICT
+-- (title) no longer has a matching constraint to target now that title
+-- alone isn't unique. `artist` is left NULL here (single override for this
+-- title, nothing to disambiguate) — see that migration file for when to
+-- set it.
+ON CONFLICT (title, COALESCE(artist, '')) DO UPDATE SET
   search_title = EXCLUDED.search_title,
   search_artist = EXCLUDED.search_artist,
   notes = EXCLUDED.notes;
@@ -36,7 +50,7 @@ VALUES (
   ARRAY['donavns'],
   'Not on MusicBrainz — small/DIY artist. Confirmed real release via Spotify/Deezer.'
 )
-ON CONFLICT (title) DO UPDATE SET
+ON CONFLICT (title, COALESCE(artist, '')) DO UPDATE SET
   skip_musicbrainz = EXCLUDED.skip_musicbrainz,
   manual_primary_type = EXCLUDED.manual_primary_type,
   manual_release_year = EXCLUDED.manual_release_year,
