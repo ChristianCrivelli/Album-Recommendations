@@ -17,27 +17,27 @@ recommendation backend that feeds it.
 Notion (my rated album library)
         │
         ▼
-ingestion/pull_albums.py       — pulls the full, paginated Notion database
+src/ingestion/pull_albums.py       — pulls the full, paginated Notion database
         │
         ▼
-ingestion/album_push_logic.py  — delta-pull: only new/changed albums go on
-        │                          to MusicBrainz; existing ones just get a
-        │                          rating/timestamp refresh
+src/ingestion/album_push_logic.py  — delta-pull: only new/changed albums go on
+        │                              to MusicBrainz; existing ones just get a
+        │                              rating/timestamp refresh
         ▼
-ingestion/album_finder.py      — looks up each new album on MusicBrainz
-        │                         (exact title + artist match only — no
-        │                         fuzzy guessing), pulling genre/style tags,
-        │                         release year, track length, and artist +
-        │                         producer credits
+src/ingestion/album_finder.py      — looks up each new album on MusicBrainz
+        │                             (exact title + artist match only — no
+        │                             fuzzy guessing), pulling genre/style tags,
+        │                             release year, track length, and artist +
+        │                             producer credits
         ▼
 Supabase (albums, artists, tags, album_contributions, album_tags)
         │
         ▼
-recommendations/similiarity_matrix.py  — builds a weighted feature matrix
-        │                                 (tags, shared artists/producers,
-        │                                 release year, track length)
+src/recommendations/similiarity_matrix.py  — builds a weighted feature matrix
+        │                                     (tags, shared artists/producers,
+        │                                     release year, track length)
         ▼
-recommendations/recommender.py — cosine similarity → "if you liked X, try Y"
+src/recommendations/recommender.py — cosine similarity → "if you liked X, try Y"
 ```
 
 Anything MusicBrainz can't confidently match (ambiguous title, artist not
@@ -45,20 +45,20 @@ indexed, obvious data-entry typo) is logged to `failed_lookups` instead of
 guessed at, and can be corrected without touching Notion via a
 `manual_overrides` row — either a search hint (tell it what to actually
 search for) or a fully manual entry (skip MusicBrainz for this title
-entirely). See `database_info/manual_override_examples.sql` for both modes
-in practice, and `database_info/schema.sql` for the full table layout.
+entirely). See `config/manual_override_examples.sql` for both modes
+in practice, and `config/schema.sql` for the full table layout.
 
 ## Running it
 
 **Requirements:** Python 3.11+, a Supabase project (see
-`database_info/schema.sql` for the schema), a Notion database of rated
+`config/schema.sql` for the schema), a Notion database of rated
 albums, and a MusicBrainz-friendly contact email (MusicBrainz's API asks for
 one in the user agent).
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in the values below
-python -m ingestion.album_push_logic
+python -m src.ingestion.album_push_logic
 ```
 
 | Variable | What it's for |
@@ -80,7 +80,7 @@ work across parallel shards to stay under GitHub Actions' job time limit.
 To build the recommendation feature matrix once the database is populated:
 
 ```bash
-python -m recommendations.similiarity_matrix
+python -m src.recommendations.similiarity_matrix
 ```
 
 ## Automation
