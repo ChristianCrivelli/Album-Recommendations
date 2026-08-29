@@ -30,6 +30,13 @@ CREATE TABLE public.albums (
   primary_type text,
   release_year text,
   avg_length numeric,
+  -- Issue #11 (Spotify integration) — see config/queries/
+  -- spotify_fallback_columns_migration.sql. All three are nullable and
+  -- populated by src/ingestion/spotify_client.py; NULL metadata_source
+  -- means the pre-existing default, MusicBrainz.
+  spotify_album_id text,
+  spotify_cover_url text,
+  metadata_source text,
   created_at timestamp with time zone NOT NULL DEFAULT timezone('utc'::text, now()),
   CONSTRAINT albums_pkey PRIMARY KEY (id)
 );

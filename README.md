@@ -66,7 +66,7 @@ python -m src.ingestion.album_push_logic
 | `notion_key`, `database_id` | Notion integration token + the album database's ID |
 | `supabase_url`, `supabase_key` | Supabase project connection |
 | `email` | Contact email sent in MusicBrainz's required user-agent string |
-| `spotify_key`, `spotify_id` | Reserved for future Spotify integration (not yet wired into the pipeline) |
+| `spotify_key`, `spotify_id` | Spotify Client Credentials (`spotify_id` = Client ID, `spotify_key` = Client Secret) — used by `src/ingestion/spotify_client.py` as a fallback when MusicBrainz has no match, for a Cover Art Archive cover-art fallback, and to resolve the Spotify album ID the public webapp embeds for in-app previews (issue #11). Optional: every function in that module degrades to `None` if these aren't set, so the pipeline still runs fine without them — just without the fallback. Get these from your own app in the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard). |
 
 By default this runs a **delta pull**: only albums that aren't already in
 Supabase get looked up on MusicBrainz; everything else just gets its rating
@@ -81,6 +81,15 @@ To build the recommendation feature matrix once the database is populated:
 
 ```bash
 python -m src.recommendations.similiarity_matrix
+```
+
+**One-off backfills** (issue #11 — run once locally after adding Spotify
+credentials; the regular pipeline handles new albums automatically going
+forward):
+
+```bash
+python -m src.ingestion.backfill_spotify_metadata  # resolve the existing MusicBrainz-miss backlog via Spotify
+python -m src.ingestion.backfill_cover_art         # probe Cover Art Archive and backfill Spotify covers where it 404s
 ```
 
 ## Automation

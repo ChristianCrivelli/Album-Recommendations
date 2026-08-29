@@ -10,6 +10,7 @@ from ingestion.album_finder import get_metadata
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 from ingestion.manual_overrides import get_override
+from ingestion.spotify_client import apply_spotify_fallback, get_cover_art_fallback
 
 
 load_dotenv()
@@ -248,6 +249,14 @@ for row in df.itertuples():
         if meta and meta.get('Release ID'):
             release_id = meta['Release ID']
 
+            # Issue #11: probe Cover Art Archive for this release group and
+            # only hit Spotify (one extra search call) when CAA doesn't
+            # have art — most albums already work fine via CAA, so this
+            # keeps the common case cheap.
+            cover_fallback = get_cover_art_fallback(
+                meta.get('Release Group ID'), row.Title, search_artist
+            )
+
             # Entity A (Album)
             album_data = {
                 "title": row.Title,
@@ -260,6 +269,8 @@ for row in df.itertuples():
                 "primary_type": meta.get('Primary Type'),
                 "release_year": meta.get('Release Year'),
                 "avg_length": meta.get('Avg Track Length (Mins)'),
+                "spotify_cover_url": cover_fallback,
+                "metadata_source": "musicbrainz",
                 "notion_created_at": row.NotionCreatedAt,
                 "notion_edited_at": row.NotionEditedAt,
             }
@@ -442,6 +453,7 @@ for row in df.itertuples():
                 "primary_type": override.get("manual_primary_type"),
                 "release_year": override.get("manual_release_year"),
                 "avg_length": override.get("manual_avg_length"),
+                "metadata_source": "manual",
                 "notion_created_at": row.NotionCreatedAt,
                 "notion_edited_at": row.NotionEditedAt,
             }
@@ -539,14 +551,39 @@ for row in df.itertuples():
 
         else:
             print(f"Could not find MusicBrainz data for {row.Title}")
-            # Tip 3: record the failure with a reason so it's easy to investigate.
-            # mb_reason now distinguishes "no candidates" / "low-confidence match"
-            # / "API error after retries" instead of one generic string, so it's
-            # obvious from failed_lookups.csv alone whether an album needs a
-            # title fix, a manual MBID override, or is just worth re-running.
-            reason = mb_reason or "MusicBrainz lookup failed"
-            failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
-            record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
+
+            # Issue #11: before giving up entirely, see if Spotify has this
+            # one — mostly catches small/DIY releases MusicBrainz doesn't
+            # index. A hit here still leaves the album without genre tags
+            # (Spotify's album search doesn't return them), so it's flagged
+            # as a lighter-weight bad egg rather than cleared outright.
+            resolved = apply_spotify_fallback(
+                supabase,
+                row.Title,
+                row.Artists,
+                extra_fields={
+                    "rating": row.Rating,
+                    "notion_created_at": row.NotionCreatedAt,
+                    "notion_edited_at": row.NotionEditedAt,
+                },
+            )
+            if resolved:
+                clear_bad_eggs(row.Title)
+                record_bad_egg(
+                    title=row.Title,
+                    artists=search_artist,
+                    reason="Resolved via Spotify fallback (no MusicBrainz match) — no tags available, needs a manual tag override if desired.",
+                )
+                print(f"Success (Spotify fallback)! {row.Title} resolved via Spotify.")
+            else:
+                # Tip 3: record the failure with a reason so it's easy to investigate.
+                # mb_reason now distinguishes "no candidates" / "low-confidence match"
+                # / "API error after retries" instead of one generic string, so it's
+                # obvious from failed_lookups.csv alone whether an album needs a
+                # title fix, a manual MBID override, or is just worth re-running.
+                reason = mb_reason or "MusicBrainz lookup failed"
+                failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
+                record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
 
     except Exception as e:
         # Safety net: nothing that happens while processing a single album —
