@@ -10,7 +10,7 @@ from ingestion.album_finder import get_metadata
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 from ingestion.manual_overrides import get_override
-from ingestion.spotify_client import apply_spotify_fallback, get_cover_art_fallback
+from ingestion.spotify_client import apply_spotify_fallback, get_cover_art_fallback, get_artist_genres
 
 
 load_dotenv()
@@ -395,6 +395,14 @@ for row in df.itertuples():
 
             top_tags = clean_and_normalize_tags(raw_tags)
 
+            # Issue #14's tag-guarantee prerequisite: MusicBrainz sometimes
+            # has a release-group match but no tags on it at all. Before
+            # falling back to a bad egg, try Spotify's artist genres —
+            # cheap (one extra call only when MusicBrainz came up empty)
+            # and closes most of what used to be a permanent gap.
+            if not top_tags:
+                top_tags = clean_and_normalize_tags(get_artist_genres(row.Artists))
+
             if top_tags:
                 # Substitute, don't just accumulate: if this album already has
                 # tags (e.g. a manually-added placeholder from a period when
@@ -435,7 +443,7 @@ for row in df.itertuples():
                 record_bad_egg(
                     title=row.Title,
                     artists=search_artist,
-                    reason="No tags found from MusicBrainz release-group or artist fallback — needs a manual tag override.",
+                    reason="No tags found from MusicBrainz release-group/artist, or Spotify artist genres — needs a manual tag override.",
                 )
 
             print(f"Success! Added {len(contributors)} contributors and {len(top_tags)} tags.")
@@ -554,10 +562,10 @@ for row in df.itertuples():
 
             # Issue #11: before giving up entirely, see if Spotify has this
             # one — mostly catches small/DIY releases MusicBrainz doesn't
-            # index. A hit here still leaves the album without genre tags
-            # (Spotify's album search doesn't return them), so it's flagged
-            # as a lighter-weight bad egg rather than cleared outright.
-            resolved = apply_spotify_fallback(
+            # index. Issue #14: apply_spotify_fallback also tries Spotify
+            # artist genres as tags, since a Spotify-fallback album has no
+            # MusicBrainz tags by definition.
+            spotify_result = apply_spotify_fallback(
                 supabase,
                 row.Title,
                 row.Artists,
@@ -567,14 +575,16 @@ for row in df.itertuples():
                     "notion_edited_at": row.NotionEditedAt,
                 },
             )
-            if resolved:
+            if spotify_result["resolved"]:
                 clear_bad_eggs(row.Title)
-                record_bad_egg(
-                    title=row.Title,
-                    artists=search_artist,
-                    reason="Resolved via Spotify fallback (no MusicBrainz match) — no tags available, needs a manual tag override if desired.",
-                )
-                print(f"Success (Spotify fallback)! {row.Title} resolved via Spotify.")
+                if not spotify_result["tagged"]:
+                    record_bad_egg(
+                        title=row.Title,
+                        artists=search_artist,
+                        reason="Resolved via Spotify fallback (no MusicBrainz match) — no tags available (Spotify had no artist genres either), needs a manual tag override if desired.",
+                    )
+                print(f"Success (Spotify fallback)! {row.Title} resolved via Spotify"
+                      f"{' with tags' if spotify_result['tagged'] else ' — still untagged'}.")
             else:
                 # Tip 3: record the failure with a reason so it's easy to investigate.
                 # mb_reason now distinguishes "no candidates" / "low-confidence match"

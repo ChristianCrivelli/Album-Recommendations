@@ -83,13 +83,14 @@ To build the recommendation feature matrix once the database is populated:
 python -m src.recommendations.similiarity_matrix
 ```
 
-**One-off backfills** (issue #11 — run once locally after adding Spotify
-credentials; the regular pipeline handles new albums automatically going
-forward):
+**One-off backfills** (issues #11 and #14 — run once locally after adding
+Spotify credentials; the regular pipeline handles new albums automatically
+going forward):
 
 ```bash
 python -m src.ingestion.backfill_spotify_metadata  # resolve the existing MusicBrainz-miss backlog via Spotify
 python -m src.ingestion.backfill_cover_art         # probe Cover Art Archive and backfill Spotify covers where it 404s
+python -m src.ingestion.backfill_tags              # try Spotify artist genres for every currently-untagged album
 ```
 
 ## Automation

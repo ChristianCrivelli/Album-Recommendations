@@ -12,6 +12,12 @@ Three angles from that issue were picked to build:
      needs no API key on the frontend/backend side at all — only the
      ingestion pipeline here needs real credentials).
 
+Also added while dealing with issue #14's tag-guarantee prerequisite:
+a genre-tag fallback (Spotify tags *artists*, not albums, with genres) for
+albums that end up with zero tags from MusicBrainz — see
+get_artist_genres() / apply_genre_tag_fallback() and
+backfill_tags.py.
+
 Everything in this module runs at ingestion time and writes its results
 into the `albums` table (spotify_album_id, spotify_cover_url,
 metadata_source). The public-facing backend never calls Spotify itself —
@@ -30,6 +36,8 @@ import os
 import time
 
 import requests
+
+from ingestion.cleaning_methods import clean_and_normalize_tags
 
 _TOKEN_URL = "https://accounts.spotify.com/api/token"
 _API_BASE = "https://api.spotify.com/v1"
@@ -166,21 +174,81 @@ def get_cover_art_fallback(mbid: str, title: str, artist: str = ""):
     return match["cover_url"] if match else None
 
 
-def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | None = None) -> bool:
+def get_artist_genres(artists) -> list[str]:
+    """Spotify tags *artists*, not albums, with genres — MusicBrainz album
+    search gives no equivalent, so this is a separate lookup used as a tag
+    fallback when an album ends up with zero tags. Aggregates genres
+    across every given artist name, deduped, in first-seen order.
+
+    `artists` may be a list or a comma-separated string. Returns [] on
+    missing credentials, no matches, or any API error."""
+    token = _get_token()
+    if not token:
+        return []
+
+    if isinstance(artists, str):
+        artists = [a.strip() for a in artists.split(",") if a.strip()]
+
+    headers = {"Authorization": f"Bearer {token}"}
+    genres: list[str] = []
+    for name in artists:
+        try:
+            resp = requests.get(
+                f"{_API_BASE}/search",
+                headers=headers,
+                params={"q": f"artist:{name}", "type": "artist", "limit": 1},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("artists", {}).get("items", [])
+        except Exception as e:
+            print(f"Warning: Spotify artist search failed for '{name}' — {e}")
+            continue
+
+        if not items:
+            continue
+        for genre in items[0].get("genres", []):
+            if genre not in genres:
+                genres.append(genre)
+
+    return genres
+
+
+def apply_genre_tags(supabase, album_id: str, tags: list[str]) -> bool:
+    """Write `tags` (already cleaned/normalized by the caller — see
+    cleaning_methods.clean_and_normalize_tags) onto an existing album,
+    replacing whatever's there. Shared by album_push_logic.py and
+    backfill_tags.py. Returns True if any tags were written."""
+    if not tags:
+        return False
+    supabase.table("album_tags").delete().eq("album_id", album_id).execute()
+    for tag_name in tags:
+        tag_resp = supabase.table("tags").upsert({"name": tag_name}, on_conflict="name").execute()
+        if tag_resp.data:
+            tag_db_id = tag_resp.data[0]["id"]
+            supabase.table("album_tags").upsert(
+                {"album_id": album_id, "tag_id": tag_db_id},
+                on_conflict="album_id,tag_id",
+            ).execute()
+    return True
+
+
+def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | None = None) -> dict:
     """When MusicBrainz has nothing for `title`, try to resolve it via
     Spotify instead and upsert a real `albums` row (metadata_source =
-    'spotify'). Shared by album_push_logic.py (inline, for new albums as
-    they're ingested) and backfill_spotify_metadata.py (against the
-    existing failed_lookups backlog) so the "resolve + write the row"
-    logic only lives in one place.
+    'spotify'), then try Spotify artist genres as tags. Shared by
+    album_push_logic.py (inline, for new albums as they're ingested) and
+    backfill_spotify_metadata.py (against the existing failed_lookups
+    backlog) so the "resolve + write the row" logic only lives in one
+    place.
 
     `artists` may be a list (preferred) or a comma-separated string.
     `extra_fields` lets a caller merge in things this function doesn't
     know about on its own (e.g. rating, notion_created_at/edited_at).
 
-    Returns True if a row was created/updated, False if Spotify had
-    nothing either — the caller should fall back to its normal bad-egg
-    recording in that case.
+    Returns {"resolved": bool, "tagged": bool} — resolved is False when
+    Spotify had nothing at all (caller should fall back to its normal
+    bad-egg recording); tagged is only meaningful when resolved is True.
     """
     if isinstance(artists, list):
         artist_list = artists
@@ -191,7 +259,7 @@ def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | N
 
     match = find_spotify_album(title, search_artist)
     if not match:
-        return False
+        return {"resolved": False, "tagged": False}
 
     album_data = {
         "title": title,
@@ -219,7 +287,7 @@ def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | N
         album_db_id = created.data[0]["id"] if created.data else None
 
     if not album_db_id:
-        return False
+        return {"resolved": False, "tagged": False}
 
     # Contributors: name-only, since Spotify's artist objects don't carry
     # a MusicBrainz mbid to link against.
@@ -238,4 +306,10 @@ def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | N
                 on_conflict="album_id,person_id,role",
             ).execute()
 
-    return True
+    # Issue #14's tag-guarantee prerequisite: a Spotify-fallback album has
+    # no MusicBrainz tags by definition, so try Spotify's artist genres
+    # before leaving it tagless.
+    genres = clean_and_normalize_tags(get_artist_genres(artist_list))
+    tagged = apply_genre_tags(supabase, album_db_id, genres)
+
+    return {"resolved": True, "tagged": tagged}

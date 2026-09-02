@@ -49,30 +49,35 @@ def main():
     by_title = {row["title"]: row.get("artists") for row in stuck if row.get("title")}
     print(f"{len(by_title)} title(s) stuck on a MusicBrainz miss — trying Spotify for each.")
 
-    resolved, still_stuck = 0, 0
+    resolved, resolved_untagged, still_stuck = 0, 0, 0
     for title, artists_str in by_title.items():
         artist_list = [a.strip() for a in (artists_str or "").split(",") if a.strip()]
         try:
-            ok = apply_spotify_fallback(supabase, title, artist_list)
+            result = apply_spotify_fallback(supabase, title, artist_list)
         except Exception as e:
             print(f"  error on {title}: {e}")
-            ok = False
+            result = {"resolved": False, "tagged": False}
 
-        if ok:
+        if result["resolved"]:
             _clear_bad_eggs(supabase, title)
-            _record_bad_egg(
-                supabase,
-                title,
-                artists_str,
-                "Resolved via Spotify fallback (no MusicBrainz match) — no tags available, needs a manual tag override if desired.",
-            )
-            print(f"  resolved: {title}")
+            if not result["tagged"]:
+                _record_bad_egg(
+                    supabase,
+                    title,
+                    artists_str,
+                    "Resolved via Spotify fallback (no MusicBrainz match) — no tags available (Spotify had no artist genres either), needs a manual tag override if desired.",
+                )
+                resolved_untagged += 1
+            print(f"  resolved{'' if result['tagged'] else ' (untagged)'}: {title}")
             resolved += 1
         else:
             print(f"  still nothing: {title}")
             still_stuck += 1
 
-    print(f"\nDone. {resolved} resolved via Spotify, {still_stuck} still need a manual look.")
+    print(
+        f"\nDone. {resolved} resolved via Spotify ({resolved - resolved_untagged} with tags, "
+        f"{resolved_untagged} still untagged), {still_stuck} still need a manual look."
+    )
 
 
 if __name__ == "__main__":
